@@ -1,0 +1,10 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(keel)
+
+include("${CMAKE_CURRENT_LIST_DIR}/keel_fontTargets.cmake")
+if(NOT TARGET keel::font AND TARGET keel::keel_font)
+    add_library(keel::font ALIAS keel::keel_font)
+endif()
+check_required_components(keel_font)
