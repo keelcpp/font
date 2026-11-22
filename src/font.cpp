@@ -190,8 +190,8 @@ void apply_outline_embolden_y_up(
     scratchBuf.resize(keel::as<keel::usize>(numPts) * 2u);
     keel::f32* origX = scratchBuf.data();
     keel::f32* origY = scratchBuf.data() + numPts;
-    std::memcpy(origX, ptsX.data(), keel::as<keel::usize>(numPts) * sizeof(keel::f32));
-    std::memcpy(origY, ptsY.data(), keel::as<keel::usize>(numPts) * sizeof(keel::f32));
+    keel::copy_n(origX, ptsX.data(), keel::as<keel::usize>(numPts));
+    keel::copy_n(origY, ptsY.data(), keel::as<keel::usize>(numPts));
 
     startIdx = 0u;
     for (keel::usize c = 0u; c < endPts.size(); ++c) {
