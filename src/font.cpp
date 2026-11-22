@@ -1,6 +1,6 @@
 #include "keel/font.h"
 #include "keel/math.h"
-#include <cstring>
+#include "keel/algo.h"
 
 namespace keel::font {
 
@@ -329,7 +329,7 @@ void apply_synthetic_bold_dilation(
                     }
                 }
             } else {
-                std::memcpy(row, rowCopy.data(), keel::as<keel::usize>(width) * sizeof(keel::f32));
+                keel::copy_n(row, rowCopy.data(), keel::as<keel::usize>(width));
             }
         }
     }
