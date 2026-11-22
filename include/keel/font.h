@@ -278,7 +278,9 @@ private:
     struct HintParams {
         bool enabled{false};
         bool snapStems{false};
+        bool snapVerticalStems{false};
         keel::f32 scale{1.0f};
+        keel::f32 xMul{1.0f};
         keel::f32 descenderUnits{0.0f};
         keel::f32 xHeightUnits{0.0f};
         keel::f32 capHeightUnits{0.0f};
@@ -294,6 +296,8 @@ private:
         keel::f32 scaleX{1.0f};
         keel::f32 italicShear{0.0f};
         keel::f32 shiftX{0.0f};
+        keel::f32 emboldenX{0.0f}; ///< Outline-space bold strength X (font units per side)
+        keel::f32 emboldenY{0.0f}; ///< Outline-space bold strength Y (font units per side)
         HintParams hint{};
 
         [[nodiscard]] keel::f32 transform_y_up(keel::f32 fy) const noexcept {
@@ -342,6 +346,13 @@ private:
         const RasterOptions& opts
     ) const noexcept;
     void apply_horizontal_stem_snapping(
+        keel::Array<keel::f32>& ptsX,
+        keel::Array<keel::f32>& ptsY,
+        const keel::Array<keel::u8>& flags,
+        const keel::Array<keel::u16>& endPts,
+        const HintParams& hint
+    ) const noexcept;
+    void apply_vertical_stem_snapping(
         keel::Array<keel::f32>& ptsX,
         keel::Array<keel::f32>& ptsY,
         const keel::Array<keel::u8>& flags,

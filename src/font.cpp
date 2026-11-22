@@ -148,6 +148,136 @@ void rasterize_edge(
     }
 }
 
+/// FreeType FT_Outline_EmboldenXY-style contour normal offset in isotropic Y-up font units.
+/// Thickens vertical, horizontal, and diagonal strokes symmetrically before blue-zone hinting
+/// and analytical scanline rasterization (zero bitmap smearing or clogged small-size counters).
+void apply_outline_embolden_y_up(
+    keel::Array<keel::f32>& ptsX,
+    keel::Array<keel::f32>& ptsY,
+    const keel::Array<keel::u16>& endPts,
+    keel::f32 strengthX,
+    keel::f32 strengthY,
+    keel::Array<keel::f32>& scratchBuf
+) noexcept {
+    const keel::u32 numPts = keel::as<keel::u32>(ptsX.size());
+    if (numPts < 3u || endPts.empty() || (strengthX <= 0.0f && strengthY <= 0.0f)) {
+        return;
+    }
+
+    // Determine global outline orientation via total signed area (Y-up: TrueType CW < 0, CFF CCW > 0)
+    keel::f32 signedArea2 = 0.0f;
+    keel::u32 startIdx = 0u;
+    for (keel::usize c = 0u; c < endPts.size(); ++c) {
+        const keel::u32 endIdx = endPts[c];
+        if (endIdx >= numPts || endIdx < startIdx) break;
+        const keel::u32 count = endIdx - startIdx + 1u;
+        if (count >= 3u) {
+            for (keel::u32 i = 0u; i < count; ++i) {
+                const keel::u32 a = startIdx + i;
+                const keel::u32 b = startIdx + ((i + 1u) % count);
+                signedArea2 += ptsX[a] * ptsY[b] - ptsX[b] * ptsY[a];
+            }
+        }
+        startIdx = endIdx + 1u;
+    }
+    if (keel::abs(signedArea2) < 1.0e-3f) {
+        return;
+    }
+
+    // For CW outer contours (signedArea2 < 0 in Y-up), outward normal of edge (dx, dy) is (-dy, +dx).
+    const keel::f32 orient = (signedArea2 < 0.0f) ? 1.0f : -1.0f;
+
+    scratchBuf.resize(keel::as<keel::usize>(numPts) * 2u);
+    keel::f32* origX = scratchBuf.data();
+    keel::f32* origY = scratchBuf.data() + numPts;
+    std::memcpy(origX, ptsX.data(), keel::as<keel::usize>(numPts) * sizeof(keel::f32));
+    std::memcpy(origY, ptsY.data(), keel::as<keel::usize>(numPts) * sizeof(keel::f32));
+
+    startIdx = 0u;
+    for (keel::usize c = 0u; c < endPts.size(); ++c) {
+        const keel::u32 endIdx = endPts[c];
+        if (endIdx >= numPts || endIdx < startIdx) break;
+        const keel::u32 count = endIdx - startIdx + 1u;
+        if (count < 3u) {
+            startIdx = endIdx + 1u;
+            continue;
+        }
+
+        for (keel::u32 i = 0u; i < count; ++i) {
+            const keel::u32 idx = startIdx + i;
+            const keel::f32 cx = origX[idx];
+            const keel::f32 cy = origY[idx];
+
+            // Incoming non-degenerate edge
+            keel::f32 inDx = 0.0f, inDy = 0.0f, inLen = 0.0f;
+            for (keel::u32 step = 1u; step < count; ++step) {
+                const keel::u32 p = startIdx + ((i + count - step) % count);
+                const keel::f32 dx = cx - origX[p];
+                const keel::f32 dy = cy - origY[p];
+                const keel::f32 len = keel::sqrt(dx * dx + dy * dy);
+                if (len > 1.0e-3f) {
+                    inDx = dx / len;
+                    inDy = dy / len;
+                    inLen = len;
+                    break;
+                }
+            }
+
+            // Outgoing non-degenerate edge
+            keel::f32 outDx = 0.0f, outDy = 0.0f, outLen = 0.0f;
+            for (keel::u32 step = 1u; step < count; ++step) {
+                const keel::u32 n = startIdx + ((i + step) % count);
+                const keel::f32 dx = origX[n] - cx;
+                const keel::f32 dy = origY[n] - cy;
+                const keel::f32 len = keel::sqrt(dx * dx + dy * dy);
+                if (len > 1.0e-3f) {
+                    outDx = dx / len;
+                    outDy = dy / len;
+                    outLen = len;
+                    break;
+                }
+            }
+
+            keel::f32 ox = 0.0f;
+            keel::f32 oy = 0.0f;
+            if (inLen > 0.0f && outLen > 0.0f) {
+                const keel::f32 nInX = -inDy * orient;
+                const keel::f32 nInY = inDx * orient;
+                const keel::f32 nOutX = -outDy * orient;
+                const keel::f32 nOutY = outDx * orient;
+                const keel::f32 bx = nInX + nOutX;
+                const keel::f32 by = nInY + nOutY;
+                const keel::f32 denom = 1.0f + (nInX * nOutX + nInY * nOutY);
+                if (denom > 0.25f) {
+                    ox = bx / denom;
+                    oy = by / denom;
+                    // Clamp miter length on acute vertices (V, A, M, N, W) to prevent spikes
+                    const keel::f32 mLen = keel::sqrt(ox * ox + oy * oy);
+                    if (mLen > 1.45f) {
+                        const keel::f32 inv = 1.45f / mLen;
+                        ox *= inv;
+                        oy *= inv;
+                    }
+                } else {
+                    const keel::f32 bLen = keel::sqrt(bx * bx + by * by);
+                    if (bLen > 1.0e-4f) {
+                        ox = bx / bLen;
+                        oy = by / bLen;
+                    } else {
+                        ox = nInX;
+                        oy = nInY;
+                    }
+                }
+            }
+
+            // Shift +strengthX so left sidebearing stays anchored, and +strengthY so baseline stays locked at 0
+            ptsX[idx] = cx + ox * strengthX + strengthX;
+            ptsY[idx] = cy + oy * strengthY + strengthY;
+        }
+        startIdx = endIdx + 1u;
+    }
+}
+
 void apply_synthetic_bold_dilation(
     keel::Array<keel::f32>& cov,
     keel::Array<keel::f32>& rowCopy,
@@ -166,19 +296,40 @@ void apply_synthetic_bold_dilation(
         rowCopy.resize(width);
         for (keel::u32 y = 0u; y < height; ++y) {
             keel::f32* row = cov.data() + keel::as<keel::usize>(y) * keel::as<keel::usize>(width);
-            std::memcpy(rowCopy.data(), row, keel::as<keel::usize>(width) * sizeof(keel::f32));
+            // Step 1: exact integer horizontal dilation by intR into rowCopy
             for (keel::u32 x = 0u; x < width; ++x) {
-                keel::f32 m = rowCopy[x];
+                keel::f32 m = row[x];
                 const keel::i32 xi = keel::as<keel::i32>(x);
                 for (keel::i32 k = 1; k <= intR && (xi - k) >= 0; ++k) {
-                    const keel::f32 s = rowCopy[keel::as<keel::usize>(xi - k)];
+                    const keel::f32 s = row[keel::as<keel::usize>(xi - k)];
                     if (s > m) m = s;
                 }
-                if (frac > 0.001f && (xi - intR - 1) >= 0) {
-                    const keel::f32 tail = rowCopy[keel::as<keel::usize>(xi - intR - 1)] * frac;
-                    if (tail > m) m = tail;
+                rowCopy[x] = m;
+            }
+            // Step 2: analytical fractional rightward edge shift with carry-overflow
+            // (avoids 2-pixel blurry ghost ramps on anti-aliased right edges)
+            if (frac > 0.001f) {
+                keel::f32 carry = 0.0f;
+                for (keel::u32 x = 0u; x < width; ++x) {
+                    const keel::f32 cur = rowCopy[x];
+                    const keel::f32 prev = (x > 0u) ? rowCopy[x - 1u] : 0.0f;
+                    if (carry > 0.0f) {
+                        row[x] = keel::min(1.0f, cur + carry);
+                        carry = 0.0f;
+                    } else if (prev > cur) {
+                        const keel::f32 combined = cur + prev * frac;
+                        if (combined > 1.0f) {
+                            row[x] = 1.0f;
+                            carry = combined - 1.0f;
+                        } else {
+                            row[x] = combined;
+                        }
+                    } else {
+                        row[x] = cur;
+                    }
                 }
-                row[x] = m;
+            } else {
+                std::memcpy(row, rowCopy.data(), keel::as<keel::usize>(width) * sizeof(keel::f32));
             }
         }
     }
@@ -479,6 +630,80 @@ keel::f32 FontFace::HintParams::map_y(keel::f32 fy) const noexcept {
     return capHeightPx + (fy - capHeightUnits) * scale;
 }
 
+namespace {
+
+struct WarpAnchor {
+    keel::f32 src{0.0f};
+    keel::f32 dst{0.0f};
+    keel::u8 priority{0u}; ///< Higher priority wins when merging near-identical anchors
+};
+
+void apply_monotonic_warp(
+    keel::Array<keel::f32>& coords,
+    keel::SmallArray<WarpAnchor, 24>& anchors
+) noexcept {
+    if (anchors.empty() || coords.empty()) {
+        return;
+    }
+
+    // Insertion sort by src ascending
+    for (keel::usize i = 1u; i < anchors.size(); ++i) {
+        const WarpAnchor key = anchors[i];
+        keel::usize j = i;
+        while (j > 0u && anchors[j - 1u].src > key.src) {
+            anchors[j] = anchors[j - 1u];
+            --j;
+        }
+        anchors[j] = key;
+    }
+
+    // Deduplicate near-identical src positions (keep higher priority)
+    keel::SmallArray<WarpAnchor, 24> clean;
+    for (keel::usize i = 0u; i < anchors.size(); ++i) {
+        if (!clean.empty() && keel::abs(anchors[i].src - clean.back().src) < 0.08f) {
+            if (anchors[i].priority > clean.back().priority) {
+                clean.back() = anchors[i];
+            }
+            continue;
+        }
+        clean.push_back(anchors[i]);
+    }
+
+    if (clean.empty()) {
+        return;
+    }
+
+    // Guarantee non-decreasing dst so contours never invert or fold
+    for (keel::usize i = 1u; i < clean.size(); ++i) {
+        if (clean[i].dst < clean[i - 1u].dst) {
+            clean[i].dst = clean[i - 1u].dst;
+        }
+    }
+
+    const keel::usize n = clean.size();
+    for (keel::usize p = 0u; p < coords.size(); ++p) {
+        const keel::f32 v = coords[p];
+        if (v <= clean[0].src) {
+            coords[p] = clean[0].dst + (v - clean[0].src);
+        } else if (v >= clean[n - 1u].src) {
+            coords[p] = clean[n - 1u].dst + (v - clean[n - 1u].src);
+        } else {
+            for (keel::usize i = 0u; i + 1u < n; ++i) {
+                const keel::f32 s0 = clean[i].src;
+                const keel::f32 s1 = clean[i + 1u].src;
+                if (v <= s1) {
+                    const keel::f32 span = s1 - s0;
+                    const keel::f32 t = (span > 1.0e-5f) ? ((v - s0) / span) : 0.0f;
+                    coords[p] = clean[i].dst + t * (clean[i + 1u].dst - clean[i].dst);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+} // namespace
+
 void FontFace::apply_horizontal_stem_snapping(
     keel::Array<keel::f32>& ptsX,
     keel::Array<keel::f32>& ptsY,
@@ -490,6 +715,10 @@ void FontFace::apply_horizontal_stem_snapping(
         return;
     }
 
+    const keel::f32 xMul = keel::max(hint.xMul, 1.0f);
+    const keel::f32 minHorizLen = 1.05f * xMul;
+    const keel::f32 minOverlap = 0.70f * xMul;
+
     struct HEdge {
         keel::f32 y{0.0f};
         keel::f32 xMin{0.0f};
@@ -500,6 +729,13 @@ void FontFace::apply_horizontal_stem_snapping(
     keel::SmallArray<HEdge, 32> edges;
     const keel::u32 numPts = keel::as<keel::u32>(ptsY.size());
     keel::u32 startIdx = 0u;
+
+    keel::f32 glyphMinY = 1.0e9f;
+    keel::f32 glyphMaxY = -1.0e9f;
+    for (keel::u32 i = 0u; i < numPts; ++i) {
+        glyphMinY = keel::min(glyphMinY, ptsY[i]);
+        glyphMaxY = keel::max(glyphMaxY, ptsY[i]);
+    }
 
     for (keel::usize c = 0u; c < endPts.size(); ++c) {
         const keel::u32 endIdx = endPts[c];
@@ -515,7 +751,7 @@ void FontFace::apply_horizontal_stem_snapping(
             if ((flags[a] & 0x01u) == 0u || (flags[b] & 0x01u) == 0u) continue;
             const keel::f32 dy = keel::abs(ptsY[b] - ptsY[a]);
             const keel::f32 dx = ptsX[b] - ptsX[a];
-            if (dy <= 0.08f && keel::abs(dx) >= 1.1f) {
+            if (dy <= 0.08f && keel::abs(dx) >= minHorizLen) {
                 const keel::f32 yAvg = 0.5f * (ptsY[a] + ptsY[b]);
                 if (edges.size() < 32u) {
                     edges.push_back(HEdge{
@@ -534,12 +770,9 @@ void FontFace::apply_horizontal_stem_snapping(
         return;
     }
 
-    struct SnapRule {
-        keel::f32 srcY{0.0f};
-        keel::f32 dstY{0.0f};
-    };
-    keel::SmallArray<SnapRule, 16> rules;
+    keel::SmallArray<WarpAnchor, 24> anchors;
     keel::StaticArray<keel::u8, 32> paired{};
+    bool hasStemSnap = false;
 
     for (keel::usize i = 0u; i < edges.size(); ++i) {
         if (paired[i] != 0u) continue;
@@ -549,7 +782,7 @@ void FontFace::apply_horizontal_stem_snapping(
             if (paired[j] != 0u) continue;
             if (edges[i].dir == edges[j].dir) continue;
             const keel::f32 overlap = keel::min(edges[i].xMax, edges[j].xMax) - keel::max(edges[i].xMin, edges[j].xMin);
-            if (overlap < 0.8f) continue;
+            if (overlap < minOverlap) continue;
             const keel::f32 dist = keel::abs(edges[i].y - edges[j].y);
             if (dist >= 0.72f && dist < bestDist) {
                 bestDist = dist;
@@ -561,16 +794,21 @@ void FontFace::apply_horizontal_stem_snapping(
             paired[bestJ] = 1u;
             const keel::f32 yTop = keel::min(edges[i].y, edges[bestJ].y);
             const keel::f32 yBot = keel::max(edges[i].y, edges[bestJ].y);
-            // Skip stems whose edges are already aligned to blue-zone integer rows
             if (is_near_int(yTop) && is_near_int(yBot)) {
+                if (anchors.size() + 2u <= 20u) {
+                    anchors.push_back(WarpAnchor{yTop, keel::round(yTop), 2u});
+                    anchors.push_back(WarpAnchor{yBot, keel::round(yBot), 2u});
+                }
                 continue;
             }
             const keel::f32 thick = yBot - yTop;
-            const keel::f32 snappedThick = keel::max(1.0f, keel::round(thick));
+            // Only snap very thin horizontal bars (<= 1.15px, small sizes <= ~13px) to 1.0px;
+            // at larger / fractional-DPI sizes, align the primary edge cleanly to an integer row
+            // while preserving the glyph's natural stroke thickness (no thinned T-bars or 1px<->2px jumps).
+            const keel::f32 snappedThick = (thick <= 1.15f) ? 1.0f : thick;
             const keel::f32 mid = 0.5f * (yTop + yBot);
             keel::f32 newTop = keel::round(mid - 0.5f * snappedThick);
             keel::f32 newBot = newTop + snappedThick;
-            // If one edge was already anchored on a blue zone (0, -xHeightPx, -capHeightPx), preserve that anchor
             if (is_near_int(yBot, 0.05f)) {
                 newBot = keel::round(yBot);
                 newTop = newBot - snappedThick;
@@ -579,26 +817,187 @@ void FontFace::apply_horizontal_stem_snapping(
                 newBot = newTop + snappedThick;
             }
             if (keel::abs(newTop - yTop) <= 0.65f && keel::abs(newBot - yBot) <= 0.65f) {
-                if (rules.size() + 2u <= 16u) {
-                    rules.push_back(SnapRule{yTop, newTop});
-                    rules.push_back(SnapRule{yBot, newBot});
+                if (anchors.size() + 2u <= 20u) {
+                    anchors.push_back(WarpAnchor{yTop, newTop, 1u});
+                    anchors.push_back(WarpAnchor{yBot, newBot, 1u});
+                    hasStemSnap = true;
                 }
             }
         }
     }
 
-    if (rules.empty()) {
+    if (!hasStemSnap) {
         return;
     }
 
-    for (keel::usize p = 0u; p < ptsY.size(); ++p) {
-        const keel::f32 y = ptsY[p];
-        for (keel::usize r = 0u; r < rules.size(); ++r) {
-            if (keel::abs(y - rules[r].srcY) <= 0.12f) {
-                ptsY[p] = rules[r].dstY;
-                break;
+    // Pin active blue zones inside glyph bounds so monotonic warp preserves baseline/x-height/cap-height
+    const keel::StaticArray<keel::f32, 4> blueZones = {{
+        -hint.capHeightPx,
+        -hint.xHeightPx,
+        0.0f,
+        -hint.descenderPx
+    }};
+    for (keel::usize b = 0u; b < blueZones.size(); ++b) {
+        const keel::f32 bz = blueZones[b];
+        if (bz >= glyphMinY - 0.25f && bz <= glyphMaxY + 0.25f && anchors.size() < 24u) {
+            anchors.push_back(WarpAnchor{bz, bz, 3u});
+        }
+    }
+
+    apply_monotonic_warp(ptsY, anchors);
+}
+
+void FontFace::apply_vertical_stem_snapping(
+    keel::Array<keel::f32>& ptsX,
+    keel::Array<keel::f32>& ptsY,
+    const keel::Array<keel::u8>& flags,
+    const keel::Array<keel::u16>& endPts,
+    const HintParams& hint
+) const noexcept {
+    if (!hint.enabled || !hint.snapVerticalStems || ptsX.empty()) {
+        return;
+    }
+
+    const keel::f32 xMul = keel::max(hint.xMul, 1.0f);
+    const keel::f32 maxDx = 0.08f * xMul;
+    const keel::f32 minVertLen = 1.25f;
+    const keel::f32 minOverlap = 0.85f;
+
+    struct VEdge {
+        keel::f32 x{0.0f};
+        keel::f32 yMin{0.0f};
+        keel::f32 yMax{0.0f};
+        keel::i8 dir{0}; ///< +1 if dy > 0, -1 if dy < 0
+    };
+
+    keel::SmallArray<VEdge, 32> edges;
+    const keel::u32 numPts = keel::as<keel::u32>(ptsX.size());
+    keel::u32 startIdx = 0u;
+
+    for (keel::usize c = 0u; c < endPts.size(); ++c) {
+        const keel::u32 endIdx = endPts[c];
+        if (endIdx >= numPts || endIdx < startIdx) break;
+        const keel::u32 count = endIdx - startIdx + 1u;
+        if (count < 2u) {
+            startIdx = endIdx + 1u;
+            continue;
+        }
+        for (keel::u32 i = 0u; i < count; ++i) {
+            const keel::u32 a = startIdx + i;
+            const keel::u32 b = startIdx + ((i + 1u) % count);
+            if ((flags[a] & 0x01u) == 0u || (flags[b] & 0x01u) == 0u) continue;
+            const keel::f32 dx = keel::abs(ptsX[b] - ptsX[a]);
+            const keel::f32 dy = ptsY[b] - ptsY[a];
+            if (dx <= maxDx && keel::abs(dy) >= minVertLen) {
+                const keel::f32 xAvg = 0.5f * (ptsX[a] + ptsX[b]);
+                if (edges.size() < 32u) {
+                    edges.push_back(VEdge{
+                        .x = xAvg,
+                        .yMin = keel::min(ptsY[a], ptsY[b]),
+                        .yMax = keel::max(ptsY[a], ptsY[b]),
+                        .dir = (dy > 0.0f) ? keel::as<keel::i8>(1) : keel::as<keel::i8>(-1)
+                    });
+                }
             }
         }
+        startIdx = endIdx + 1u;
+    }
+
+    if (edges.size() < 2u) {
+        return;
+    }
+
+    struct VStem {
+        keel::f32 xL{0.0f};
+        keel::f32 xR{0.0f};
+        keel::f32 widthPx{0.0f};
+    };
+
+    keel::SmallArray<VStem, 12> stems;
+    keel::StaticArray<keel::u8, 32> paired{};
+
+    for (keel::usize i = 0u; i < edges.size(); ++i) {
+        if (paired[i] != 0u) continue;
+        keel::usize bestJ = edges.size();
+        keel::f32 bestDistPx = 3.6f;
+        for (keel::usize j = i + 1u; j < edges.size(); ++j) {
+            if (paired[j] != 0u) continue;
+            if (edges[i].dir == edges[j].dir) continue;
+            const keel::f32 overlap = keel::min(edges[i].yMax, edges[j].yMax) - keel::max(edges[i].yMin, edges[j].yMin);
+            if (overlap < minOverlap) continue;
+            const keel::f32 distPx = keel::abs(edges[i].x - edges[j].x) / xMul;
+            if (distPx >= 0.68f && distPx < bestDistPx) {
+                bestDistPx = distPx;
+                bestJ = j;
+            }
+        }
+        if (bestJ < edges.size() && stems.size() < 12u) {
+            paired[i] = 1u;
+            paired[bestJ] = 1u;
+            const keel::f32 xL = keel::min(edges[i].x, edges[bestJ].x);
+            const keel::f32 xR = keel::max(edges[i].x, edges[bestJ].x);
+            stems.push_back(VStem{xL, xR, bestDistPx});
+        }
+    }
+
+    if (stems.empty()) {
+        return;
+    }
+
+    // Sort stems left-to-right and drop any overlapping stem pairs
+    for (keel::usize i = 1u; i < stems.size(); ++i) {
+        const VStem key = stems[i];
+        keel::usize j = i;
+        while (j > 0u && stems[j - 1u].xL > key.xL) {
+            stems[j] = stems[j - 1u];
+            --j;
+        }
+        stems[j] = key;
+    }
+
+    // Compute unified stem width across all stems in this glyph using a conservative threshold
+    // (+0.22px bias) so stems around 1.45-1.65px do not split between 1px lowercase and 2px uppercase.
+    keel::f32 sumW = 0.0f;
+    for (keel::usize i = 0u; i < stems.size(); ++i) {
+        sumW += stems[i].widthPx;
+    }
+    const keel::f32 avgW = sumW / keel::as<keel::f32>(stems.size());
+    const keel::f32 targetStemPx = keel::max(1.0f, keel::floor(avgW + 0.22f));
+
+    keel::SmallArray<WarpAnchor, 24> anchors;
+    keel::f32 prevDstR = -1.0e9f;
+    for (keel::usize i = 0u; i < stems.size(); ++i) {
+        const keel::f32 xL = stems[i].xL;
+        const keel::f32 xR = stems[i].xR;
+        if (i > 0u && xL < stems[i - 1u].xR - 0.1f * xMul) {
+            continue;
+        }
+        const keel::f32 useWPx = (keel::abs(stems[i].widthPx - avgW) <= 0.35f)
+            ? targetStemPx
+            : keel::max(1.0f, keel::floor(stems[i].widthPx + 0.22f));
+        const keel::f32 midPx = 0.5f * (xL + xR) / xMul;
+        keel::f32 newLPx = keel::round(midPx - 0.5f * useWPx);
+        keel::f32 newRPx = newLPx + useWPx;
+
+        // Preserve at least 1px counter gap between adjacent vertical stems (e.g. 'm', 'n', 'H')
+        if (prevDstR > -1.0e8f && newLPx < prevDstR + 1.0f) {
+            newLPx = prevDstR + 1.0f;
+            newRPx = newLPx + useWPx;
+        }
+
+        const keel::f32 newL = newLPx * xMul;
+        const keel::f32 newR = newRPx * xMul;
+        if (keel::abs(newLPx - xL / xMul) <= 0.85f && keel::abs(newRPx - xR / xMul) <= 0.85f) {
+            if (anchors.size() + 2u <= 24u) {
+                anchors.push_back(WarpAnchor{xL, newL, 1u});
+                anchors.push_back(WarpAnchor{xR, newR, 1u});
+                prevDstR = newRPx;
+            }
+        }
+    }
+
+    if (!anchors.empty()) {
+        apply_monotonic_warp(ptsX, anchors);
     }
 }
 
@@ -1787,7 +2186,12 @@ keel::f32 FontFace::advance_width_px(
         advPx = keel::round(advPx);
     }
     if (syntheticBold) {
-        advPx += 0.35f;
+        if (!m_isCff) {
+            advPx += fontSizePx * 0.042f;
+        } else {
+            const keel::f32 boldRadiusPx = keel::clamp(fontSizePx / 22.0f, 0.45f, 2.2f);
+            advPx += boldRadiusPx * 0.85f;
+        }
     }
     return advPx;
 }
@@ -2272,8 +2676,24 @@ bool FontFace::extract_ttf_glyph_outline(
         for (keel::u32 i = 0u; i < numPts; ++i) {
             const keel::f32 ux = keel::as<keel::f32>(scratch.rawX[i]) + (applyVar ? scratch.varDeltaX[i] : 0.0f);
             const keel::f32 uy = keel::as<keel::f32>(scratch.rawY[i]) + (applyVar ? scratch.varDeltaY[i] : 0.0f);
-            const keel::f32 fx = m00 * ux + m01 * uy + tx;
-            const keel::f32 fy = m10 * ux + m11 * uy + ty;
+            scratch.ptsX[i] = m00 * ux + m01 * uy + tx;
+            scratch.ptsY[i] = m10 * ux + m11 * uy + ty;
+        }
+
+        if (xf.emboldenX > 0.0f || xf.emboldenY > 0.0f) {
+            apply_outline_embolden_y_up(
+                scratch.ptsX,
+                scratch.ptsY,
+                scratch.endPts,
+                xf.emboldenX,
+                xf.emboldenY,
+                scratch.boldRowScratch
+            );
+        }
+
+        for (keel::u32 i = 0u; i < numPts; ++i) {
+            const keel::f32 fx = scratch.ptsX[i];
+            const keel::f32 fy = scratch.ptsY[i];
             if (outPointsX && outPointsY) {
                 outPointsX->push_back(fx);
                 outPointsY->push_back(fy);
@@ -2283,8 +2703,13 @@ bool FontFace::extract_ttf_glyph_outline(
             scratch.ptsY[i] = -pyUp;
         }
 
-        if (xf.hint.snapStems && depth == 0u) {
-            apply_horizontal_stem_snapping(scratch.ptsX, scratch.ptsY, scratch.flags, scratch.endPts, xf.hint);
+        if (depth == 0u) {
+            if (xf.hint.snapStems) {
+                apply_horizontal_stem_snapping(scratch.ptsX, scratch.ptsY, scratch.flags, scratch.endPts, xf.hint);
+            }
+            if (xf.hint.snapVerticalStems) {
+                apply_vertical_stem_snapping(scratch.ptsX, scratch.ptsY, scratch.flags, scratch.endPts, xf.hint);
+            }
         }
 
         keel::u32 startIdx = 0u;
@@ -3165,25 +3590,45 @@ FontFace::Transform2D FontFace::make_transform(
 ) const noexcept {
     const keel::f32 scale = fontSizePx / keel::as<keel::f32>(m_unitsPerEm);
     const keel::f32 xMul = opts.subpixel ? 3.0f : 1.0f;
+    // In LCD 3x mode, align phases directly to the physical 1/3-pixel subpixel grid (0, 1, 2 subpixels).
+    // In Grayscale mode, use 1/4-pixel phases (0.00, 0.25, 0.50, 0.75 px).
     const keel::f32 phasePx = (opts.hinting != Hinting::Normal)
-        ? (keel::as<keel::f32>(opts.subpixelPhase & 0x03u) * 0.25f)
+        ? (opts.subpixel
+            ? (keel::as<keel::f32>(opts.subpixelPhase % 3u) / 3.0f)
+            : (keel::as<keel::f32>(opts.subpixelPhase & 0x03u) * 0.25f))
         : 0.0f;
 
     Transform2D xf{};
     xf.scaleX = scale * xMul;
     xf.italicShear = opts.syntheticItalic ? (0.18f * xMul) : 0.0f;
     xf.shiftX = phasePx * xMul;
+    if (opts.syntheticBold && !m_isCff && m_unitsPerEm > 0u) {
+        const keel::f32 em = keel::as<keel::f32>(m_unitsPerEm);
+        xf.emboldenX = em * 0.020f;
+        xf.emboldenY = em * 0.014f;
+    }
     xf.hint.scale = scale;
+    xf.hint.xMul = xMul;
     xf.hint.enabled = (opts.hinting != Hinting::None) && (m_xHeight > 0) && (m_capHeight > m_xHeight);
     xf.hint.snapStems = xf.hint.enabled && (fontSizePx <= 32.0f);
+    xf.hint.snapVerticalStems = xf.hint.enabled && (opts.hinting == Hinting::Normal) &&
+                                !opts.syntheticItalic && !m_isItalic && (fontSizePx <= 15.5f);
     if (xf.hint.enabled) {
+        // When outline emboldening is active, contours grow by +2*emboldenY above baseline
+        // (since baseline is locked at y=0 by the +emboldenY shift). Track the emboldened
+        // x-height and cap-height so blue-zone snapping aligns Bold tops cleanly to pixel rows!
+        const keel::f32 boldTopBoost = 2.0f * xf.emboldenY;
         xf.hint.descenderUnits = keel::as<keel::f32>(m_descenderBlue);
-        xf.hint.xHeightUnits = keel::as<keel::f32>(m_xHeight);
-        xf.hint.capHeightUnits = keel::as<keel::f32>(m_capHeight);
+        xf.hint.xHeightUnits = keel::as<keel::f32>(m_xHeight) + boldTopBoost;
+        xf.hint.capHeightUnits = keel::as<keel::f32>(m_capHeight) + boldTopBoost;
         xf.hint.descenderPx = (m_descenderBlue < 0) ? -keel::max(1.0f, keel::round(-xf.hint.descenderUnits * scale)) : 0.0f;
         xf.hint.xHeightPx = keel::max(1.0f, keel::round(xf.hint.xHeightUnits * scale));
         xf.hint.capHeightPx = keel::max(xf.hint.xHeightPx + 1.0f, keel::round(xf.hint.capHeightUnits * scale));
-        xf.hint.overshootClampUnits = (fontSizePx <= 28.0f) ? (0.42f / scale) : 0.0f;
+        // Do not hard-clamp Bezier control points onto blue zones: clamping outer arch vertices
+        // while leaving inner bowl vertices unmoved shaves off rounded tops ('e','s','c','o','S'),
+        // flattens ascenders ('h','k','b','d'), and thins 'i'/'j' dots. Smooth piecewise linear
+        // blue-zone mapping already aligns baselines, x-heights, and cap-heights cleanly.
+        xf.hint.overshootClampUnits = 0.0f;
     }
     return xf;
 }
@@ -3261,7 +3706,13 @@ bool FontFace::rasterize(
             const keel::f32 baseAdvUnits = keel::as<keel::f32>(advance_width_units(glyphIndex)) + phantomAdvDelta;
             advPx = keel::max(0.0f, baseAdvUnits * scale);
             if (opts.hinting == Hinting::Normal) advPx = keel::round(advPx);
-            if (opts.syntheticBold) advPx += 0.35f;
+            if (opts.syntheticBold) {
+                if (!m_isCff) {
+                    advPx += fontSizePx * 0.042f;
+                } else {
+                    advPx += keel::clamp(fontSizePx / 22.0f, 0.45f, 2.2f) * 0.85f;
+                }
+            }
         }
     }
     out.advancePx = advPx;
@@ -3284,9 +3735,11 @@ bool FontFace::rasterize(
         return true;
     }
 
-    const keel::f32 boldRadiusPx = opts.syntheticBold ? keel::clamp(fontSizePx / 22.0f, 0.45f, 2.2f) : 0.0f;
+    const bool bitmapBold = opts.syntheticBold && m_isCff;
+    const keel::f32 boldRadiusPx = bitmapBold ? keel::clamp(fontSizePx / 22.0f, 0.45f, 2.2f) : 0.0f;
+    const keel::f32 boldRadiusY = bitmapBold ? keel::clamp((fontSizePx - 22.0f) / 60.0f, 0.0f, 0.75f) : 0.0f;
     const keel::f32 boldPadRight = boldRadiusPx * xMul;
-    const keel::f32 boldPadTop = opts.syntheticBold ? (boldRadiusPx * 0.35f) : 0.0f;
+    const keel::f32 boldPadTop = boldRadiusY;
     const keel::f32 lcdPad = opts.subpixel ? 2.0f : 0.0f;
 
     keel::i32 minPixX = 0, maxPixX = 0;
@@ -3341,8 +3794,8 @@ bool FontFace::rasterize(
         }
     }
 
-    if (opts.syntheticBold) {
-        apply_synthetic_bold_dilation(sc.coverageBuf, sc.boldRowScratch, bufW, bufH, boldRadiusPx * xMul, boldRadiusPx * 0.35f);
+    if (bitmapBold) {
+        apply_synthetic_bold_dilation(sc.coverageBuf, sc.boldRowScratch, bufW, bufH, boldRadiusPx * xMul, boldRadiusY);
     }
 
     const keel::u32 rowBytes = opts.subpixel ? (keel::as<keel::u32>(pixelW) * 3u) : keel::as<keel::u32>(pixelW);
@@ -3356,21 +3809,34 @@ bool FontFace::rasterize(
     out.pixels.resize(keel::as<keel::usize>(rowBytes) * keel::as<keel::usize>(bufH));
 
     if (opts.subpixel) {
-        static constexpr keel::f32 kW0 = 16.0f / 256.0f;
-        static constexpr keel::f32 kW1 = 64.0f / 256.0f;
-        static constexpr keel::f32 kW2 = 112.0f / 256.0f;
+        // FreeType FT_LCD_FILTER_DEFAULT (Gibson 5-tap balanced FIR) + DirectWrite ClearType
+        // intra-pixel chroma softening to prevent orange/cyan fringes on dark UIs and colored code
+        // while preserving 3x horizontal subpixel positioning clarity.
+        static constexpr keel::f32 kW0 = 8.0f / 256.0f;
+        static constexpr keel::f32 kW1 = 77.0f / 256.0f;
+        static constexpr keel::f32 kW2 = 86.0f / 256.0f;
+        static constexpr keel::f32 kChromaKeep = 0.62f;
+        static constexpr keel::f32 kChromaBlend = 1.0f - kChromaKeep;
 
         for (keel::u32 y = 0u; y < bufH; ++y) {
             const keel::f32* src = sc.coverageBuf.data() + keel::as<keel::usize>(y) * keel::as<keel::usize>(bufW);
             keel::u8* dst = out.pixels.data() + keel::as<keel::usize>(y) * keel::as<keel::usize>(rowBytes);
-            for (keel::u32 x = 0u; x < bufW; ++x) {
-                const keel::f32 sM2 = (x >= 2u) ? src[x - 2u] : 0.0f;
-                const keel::f32 sM1 = (x >= 1u) ? src[x - 1u] : 0.0f;
-                const keel::f32 s0  = src[x];
-                const keel::f32 sP1 = (x + 1u < bufW) ? src[x + 1u] : 0.0f;
-                const keel::f32 sP2 = (x + 2u < bufW) ? src[x + 2u] : 0.0f;
-                const keel::f32 filtered = kW0 * sM2 + kW1 * sM1 + kW2 * s0 + kW1 * sP1 + kW0 * sP2;
-                dst[x] = keel::as<keel::u8>(keel::clamp(keel::round_i32(filtered * 255.0f), 0, 255));
+            for (keel::u32 px = 0u; px < keel::as<keel::u32>(pixelW); ++px) {
+                keel::f32 rgb[3]{};
+                for (keel::u32 c = 0u; c < 3u; ++c) {
+                    const keel::u32 x = px * 3u + c;
+                    const keel::f32 sM2 = (x >= 2u) ? src[x - 2u] : 0.0f;
+                    const keel::f32 sM1 = (x >= 1u) ? src[x - 1u] : 0.0f;
+                    const keel::f32 s0  = src[x];
+                    const keel::f32 sP1 = (x + 1u < bufW) ? src[x + 1u] : 0.0f;
+                    const keel::f32 sP2 = (x + 2u < bufW) ? src[x + 2u] : 0.0f;
+                    rgb[c] = kW0 * sM2 + kW1 * sM1 + kW2 * s0 + kW1 * sP1 + kW0 * sP2;
+                }
+                const keel::f32 avg = (rgb[0] + rgb[1] + rgb[2]) * (1.0f / 3.0f);
+                for (keel::u32 c = 0u; c < 3u; ++c) {
+                    const keel::f32 soft = rgb[c] * kChromaKeep + avg * kChromaBlend;
+                    dst[px * 3u + c] = keel::as<keel::u8>(keel::clamp(keel::round_i32(soft * 255.0f), 0, 255));
+                }
             }
         }
     } else {
