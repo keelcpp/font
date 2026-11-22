@@ -1,18 +1,10 @@
 #include "keel/font.h"
 #include "keel/math.h"
-#include "keel/static_array.h"
 #include <cstring>
 
 namespace keel::font {
 
 namespace {
-
-[[nodiscard]] constexpr keel::u32 make_tag(char a, char b, char c, char d) noexcept {
-    return (keel::as<keel::u32>(keel::as<keel::u8>(a)) << 24u) |
-           (keel::as<keel::u32>(keel::as<keel::u8>(b)) << 16u) |
-           (keel::as<keel::u32>(keel::as<keel::u8>(c)) << 8u) |
-           keel::as<keel::u32>(keel::as<keel::u8>(d));
-}
 
 [[nodiscard]] constexpr keel::u32 popcount8(keel::u32 v) noexcept {
     keel::u32 c = 0u;
@@ -28,6 +20,35 @@ namespace {
     if (count < 1240u) return 107;
     if (count < 33900u) return 1131;
     return 32768;
+}
+
+[[nodiscard]] constexpr bool is_near_int(keel::f32 v, keel::f32 eps = 0.08f) noexcept {
+    return keel::abs(v - keel::round(v)) <= eps;
+}
+
+void append_utf8(keel::SmallString<64>& dst, keel::u32 cp) noexcept {
+    if (cp == 0u) return;
+    if (cp < 0x80u) {
+        if (dst.size() + 1u < 64u) dst.push_back(keel::as<char>(cp));
+    } else if (cp < 0x800u) {
+        if (dst.size() + 2u < 64u) {
+            dst.push_back(keel::as<char>(0xC0u | (cp >> 6u)));
+            dst.push_back(keel::as<char>(0x80u | (cp & 0x3Fu)));
+        }
+    } else if (cp < 0x10000u) {
+        if (dst.size() + 3u < 64u) {
+            dst.push_back(keel::as<char>(0xE0u | (cp >> 12u)));
+            dst.push_back(keel::as<char>(0x80u | ((cp >> 6u) & 0x3Fu)));
+            dst.push_back(keel::as<char>(0x80u | (cp & 0x3Fu)));
+        }
+    } else if (cp <= 0x10FFFFu) {
+        if (dst.size() + 4u < 64u) {
+            dst.push_back(keel::as<char>(0xF0u | (cp >> 18u)));
+            dst.push_back(keel::as<char>(0x80u | ((cp >> 12u) & 0x3Fu)));
+            dst.push_back(keel::as<char>(0x80u | ((cp >> 6u) & 0x3Fu)));
+            dst.push_back(keel::as<char>(0x80u | (cp & 0x3Fu)));
+        }
+    }
 }
 
 // ==============================================================================
@@ -129,6 +150,7 @@ void rasterize_edge(
 
 void apply_synthetic_bold_dilation(
     keel::Array<keel::f32>& cov,
+    keel::Array<keel::f32>& rowCopy,
     keel::u32 width,
     keel::u32 height,
     keel::f32 radiusX,
@@ -141,7 +163,6 @@ void apply_synthetic_bold_dilation(
     if (radiusX > 0.01f) {
         const keel::i32 intR = keel::floor_i32(radiusX);
         const keel::f32 frac = radiusX - keel::as<keel::f32>(intR);
-        keel::Array<keel::f32> rowCopy;
         rowCopy.resize(width);
         for (keel::u32 y = 0u; y < height; ++y) {
             keel::f32* row = cov.data() + keel::as<keel::usize>(y) * keel::as<keel::usize>(width);
@@ -177,10 +198,106 @@ void apply_synthetic_bold_dilation(
     }
 }
 
+// ==============================================================================
+// OpenType `gvar` IUP (Interpolated Untouched Points) Helper
+// ==============================================================================
+
+void apply_iup_axis(
+    const keel::Array<keel::i32>& origCoord,
+    keel::Array<keel::f32>& tupleDelta,
+    const keel::Array<keel::u8>& touched,
+    keel::u32 startIdx,
+    keel::u32 endIdx
+) noexcept {
+    const keel::u32 count = endIdx - startIdx + 1u;
+    if (count < 2u) return;
+
+    keel::u32 firstTouched = 0xFFFFFFFFu;
+    keel::u32 touchedCount = 0u;
+    for (keel::u32 i = startIdx; i <= endIdx; ++i) {
+        if (touched[i] != 0u) {
+            if (firstTouched == 0xFFFFFFFFu) firstTouched = i;
+            ++touchedCount;
+        }
+    }
+    if (touchedCount == 0u || touchedCount == count) {
+        return;
+    }
+    if (touchedCount == 1u) {
+        const keel::f32 d = tupleDelta[firstTouched];
+        for (keel::u32 i = startIdx; i <= endIdx; ++i) {
+            tupleDelta[i] = d;
+        }
+        return;
+    }
+
+    keel::u32 pA = firstTouched;
+    for (;;) {
+        // Find next touched point wrapping around the contour
+        keel::u32 pB = pA;
+        for (keel::u32 step = 1u; step <= count; ++step) {
+            const keel::u32 cand = startIdx + ((pA - startIdx + step) % count);
+            if (touched[cand] != 0u) {
+                pB = cand;
+                break;
+            }
+        }
+
+        const keel::f32 cA = keel::as<keel::f32>(origCoord[pA]);
+        const keel::f32 cB = keel::as<keel::f32>(origCoord[pB]);
+        const keel::f32 dA = tupleDelta[pA];
+        const keel::f32 dB = tupleDelta[pB];
+        const keel::f32 cMin = keel::min(cA, cB);
+        const keel::f32 cMax = keel::max(cA, cB);
+
+        for (keel::u32 step = 1u; step < count; ++step) {
+            const keel::u32 q = startIdx + ((pA - startIdx + step) % count);
+            if (q == pB) break;
+            const keel::f32 cQ = keel::as<keel::f32>(origCoord[q]);
+            if (cA == cB) {
+                tupleDelta[q] = (dA == dB) ? dA : 0.0f;
+            } else if (cQ <= cMin) {
+                tupleDelta[q] = (cA < cB) ? dA : dB;
+            } else if (cQ >= cMax) {
+                tupleDelta[q] = (cA > cB) ? dA : dB;
+            } else {
+                const keel::f32 t = (cQ - cA) / (cB - cA);
+                tupleDelta[q] = dA + t * (dB - dA);
+            }
+        }
+
+        pA = pB;
+        if (pA == firstTouched) break;
+    }
+}
+
 } // namespace
 
 // ==============================================================================
-// OutlineBuilder — Adaptive Bezier Flattening
+// RasterScratch
+// ==============================================================================
+
+void RasterScratch::release() noexcept {
+    segments = {};
+    deltaBuf = {};
+    coverageBuf = {};
+    boldRowScratch = {};
+    endPts = {};
+    flags = {};
+    rawX = {};
+    rawY = {};
+    ptsX = {};
+    ptsY = {};
+    varDeltaX = {};
+    varDeltaY = {};
+    tupleDeltaX = {};
+    tupleDeltaY = {};
+    varTouched = {};
+    varPointIndices = {};
+}
+
+// ==============================================================================
+// OutlineBuilder — Vector Sink OR Adaptive Bezier Flattening
 // ==============================================================================
 
 void FontFace::OutlineBuilder::move_to(keel::f32 x, keel::f32 y) {
@@ -190,6 +307,9 @@ void FontFace::OutlineBuilder::move_to(keel::f32 x, keel::f32 y) {
     startX = x;
     startY = y;
     hasContour = true;
+    if (sink && sink->move_to) {
+        sink->move_to(sink->user, x, y);
+    }
 }
 
 void FontFace::OutlineBuilder::line_to(keel::f32 x, keel::f32 y) {
@@ -198,7 +318,12 @@ void FontFace::OutlineBuilder::line_to(keel::f32 x, keel::f32 y) {
         return;
     }
     if (x != curX || y != curY) {
-        segments.push_back(Segment{curX, curY, x, y});
+        if (sink && sink->line_to) {
+            sink->line_to(sink->user, x, y);
+        }
+        if (segments) {
+            segments->push_back(RasterScratch::Segment{curX, curY, x, y});
+        }
         curX = x;
         curY = y;
     }
@@ -214,6 +339,14 @@ void FontFace::OutlineBuilder::quad_to(
     if (!hasContour) {
         move_to(x, y);
         return;
+    }
+    if (sink) {
+        if (sink->quad_to) {
+            sink->quad_to(sink->user, cx, cy, x, y);
+            curX = x;
+            curY = y;
+            return;
+        }
     }
     const keel::f32 x0 = curX;
     const keel::f32 y0 = curY;
@@ -253,6 +386,14 @@ void FontFace::OutlineBuilder::cubic_to(
         move_to(x, y);
         return;
     }
+    if (sink) {
+        if (sink->cubic_to) {
+            sink->cubic_to(sink->user, c1x, c1y, c2x, c2y, x, y);
+            curX = x;
+            curY = y;
+            return;
+        }
+    }
     const keel::f32 x0 = curX;
     const keel::f32 y0 = curY;
     const keel::f32 ax = x0 - 2.0f * c1x + c2x;
@@ -284,17 +425,20 @@ void FontFace::OutlineBuilder::cubic_to(
 
 void FontFace::OutlineBuilder::close_contour() {
     if (hasContour) {
-        if (curX != startX || curY != startY) {
-            segments.push_back(Segment{curX, curY, startX, startY});
+        if (segments && (curX != startX || curY != startY)) {
+            segments->push_back(RasterScratch::Segment{curX, curY, startX, startY});
             curX = startX;
             curY = startY;
+        }
+        if (sink && sink->close) {
+            sink->close(sink->user);
         }
         hasContour = false;
     }
 }
 
 // ==============================================================================
-// Lightweight Vertical Blue-Zone Autohinting
+// Vertical Blue-Zone Autohinting + Horizontal Stem Snapping
 // ==============================================================================
 
 keel::f32 FontFace::HintParams::map_y(keel::f32 fy) const noexcept {
@@ -312,9 +456,18 @@ keel::f32 FontFace::HintParams::map_y(keel::f32 fy) const noexcept {
         if (fy > capHeightUnits && fy <= capHeightUnits + overshootClampUnits) {
             return capHeightPx;
         }
+        if (descenderUnits < 0.0f && fy < descenderUnits && fy >= descenderUnits - overshootClampUnits) {
+            return descenderPx;
+        }
     }
 
-    if (fy <= 0.0f) {
+    if (fy < 0.0f) {
+        if (descenderUnits < 0.0f && fy >= descenderUnits) {
+            return fy * (descenderPx / descenderUnits);
+        }
+        if (descenderUnits < 0.0f) {
+            return descenderPx + (fy - descenderUnits) * scale;
+        }
         return fy * scale;
     }
     if (fy <= xHeightUnits) {
@@ -324,6 +477,129 @@ keel::f32 FontFace::HintParams::map_y(keel::f32 fy) const noexcept {
         return xHeightPx + (fy - xHeightUnits) * ((capHeightPx - xHeightPx) / (capHeightUnits - xHeightUnits));
     }
     return capHeightPx + (fy - capHeightUnits) * scale;
+}
+
+void FontFace::apply_horizontal_stem_snapping(
+    keel::Array<keel::f32>& ptsX,
+    keel::Array<keel::f32>& ptsY,
+    const keel::Array<keel::u8>& flags,
+    const keel::Array<keel::u16>& endPts,
+    const HintParams& hint
+) const noexcept {
+    if (!hint.enabled || !hint.snapStems || ptsY.empty()) {
+        return;
+    }
+
+    struct HEdge {
+        keel::f32 y{0.0f};
+        keel::f32 xMin{0.0f};
+        keel::f32 xMax{0.0f};
+        keel::i8 dir{0}; ///< +1 if dx > 0, -1 if dx < 0
+    };
+
+    keel::SmallArray<HEdge, 32> edges;
+    const keel::u32 numPts = keel::as<keel::u32>(ptsY.size());
+    keel::u32 startIdx = 0u;
+
+    for (keel::usize c = 0u; c < endPts.size(); ++c) {
+        const keel::u32 endIdx = endPts[c];
+        if (endIdx >= numPts || endIdx < startIdx) break;
+        const keel::u32 count = endIdx - startIdx + 1u;
+        if (count < 2u) {
+            startIdx = endIdx + 1u;
+            continue;
+        }
+        for (keel::u32 i = 0u; i < count; ++i) {
+            const keel::u32 a = startIdx + i;
+            const keel::u32 b = startIdx + ((i + 1u) % count);
+            if ((flags[a] & 0x01u) == 0u || (flags[b] & 0x01u) == 0u) continue;
+            const keel::f32 dy = keel::abs(ptsY[b] - ptsY[a]);
+            const keel::f32 dx = ptsX[b] - ptsX[a];
+            if (dy <= 0.08f && keel::abs(dx) >= 1.1f) {
+                const keel::f32 yAvg = 0.5f * (ptsY[a] + ptsY[b]);
+                if (edges.size() < 32u) {
+                    edges.push_back(HEdge{
+                        .y = yAvg,
+                        .xMin = keel::min(ptsX[a], ptsX[b]),
+                        .xMax = keel::max(ptsX[a], ptsX[b]),
+                        .dir = (dx > 0.0f) ? keel::as<keel::i8>(1) : keel::as<keel::i8>(-1)
+                    });
+                }
+            }
+        }
+        startIdx = endIdx + 1u;
+    }
+
+    if (edges.size() < 2u) {
+        return;
+    }
+
+    struct SnapRule {
+        keel::f32 srcY{0.0f};
+        keel::f32 dstY{0.0f};
+    };
+    keel::SmallArray<SnapRule, 16> rules;
+    keel::StaticArray<keel::u8, 32> paired{};
+
+    for (keel::usize i = 0u; i < edges.size(); ++i) {
+        if (paired[i] != 0u) continue;
+        keel::usize bestJ = edges.size();
+        keel::f32 bestDist = 3.5f;
+        for (keel::usize j = i + 1u; j < edges.size(); ++j) {
+            if (paired[j] != 0u) continue;
+            if (edges[i].dir == edges[j].dir) continue;
+            const keel::f32 overlap = keel::min(edges[i].xMax, edges[j].xMax) - keel::max(edges[i].xMin, edges[j].xMin);
+            if (overlap < 0.8f) continue;
+            const keel::f32 dist = keel::abs(edges[i].y - edges[j].y);
+            if (dist >= 0.72f && dist < bestDist) {
+                bestDist = dist;
+                bestJ = j;
+            }
+        }
+        if (bestJ < edges.size()) {
+            paired[i] = 1u;
+            paired[bestJ] = 1u;
+            const keel::f32 yTop = keel::min(edges[i].y, edges[bestJ].y);
+            const keel::f32 yBot = keel::max(edges[i].y, edges[bestJ].y);
+            // Skip stems whose edges are already aligned to blue-zone integer rows
+            if (is_near_int(yTop) && is_near_int(yBot)) {
+                continue;
+            }
+            const keel::f32 thick = yBot - yTop;
+            const keel::f32 snappedThick = keel::max(1.0f, keel::round(thick));
+            const keel::f32 mid = 0.5f * (yTop + yBot);
+            keel::f32 newTop = keel::round(mid - 0.5f * snappedThick);
+            keel::f32 newBot = newTop + snappedThick;
+            // If one edge was already anchored on a blue zone (0, -xHeightPx, -capHeightPx), preserve that anchor
+            if (is_near_int(yBot, 0.05f)) {
+                newBot = keel::round(yBot);
+                newTop = newBot - snappedThick;
+            } else if (is_near_int(yTop, 0.05f)) {
+                newTop = keel::round(yTop);
+                newBot = newTop + snappedThick;
+            }
+            if (keel::abs(newTop - yTop) <= 0.65f && keel::abs(newBot - yBot) <= 0.65f) {
+                if (rules.size() + 2u <= 16u) {
+                    rules.push_back(SnapRule{yTop, newTop});
+                    rules.push_back(SnapRule{yBot, newBot});
+                }
+            }
+        }
+    }
+
+    if (rules.empty()) {
+        return;
+    }
+
+    for (keel::usize p = 0u; p < ptsY.size(); ++p) {
+        const keel::f32 y = ptsY[p];
+        for (keel::usize r = 0u; r < rules.size(); ++r) {
+            if (keel::abs(y - rules[r].srcY) <= 0.12f) {
+                ptsY[p] = rules[r].dstY;
+                break;
+            }
+        }
+    }
 }
 
 // ==============================================================================
@@ -366,14 +642,39 @@ bool FontFace::read_i32(keel::usize off, keel::i32& out) const noexcept {
 }
 
 // ==============================================================================
-// SFNT Loading (TTF / TTC / OTF)
+// SFNT Loading (TTF / TTC Multi-Face / OTF) & Metadata (`name`, `OS/2`, `post`)
 // ==============================================================================
 
-bool FontFace::load(keel::ArrayRef<keel::u8> data) noexcept {
-    return load(data.data(), data.size());
+keel::u32 FontFace::face_count(keel::ArrayRef<keel::u8> data) noexcept {
+    return face_count(data.data(), data.size());
 }
 
-bool FontFace::load(const keel::u8* data, keel::usize size) noexcept {
+keel::u32 FontFace::face_count(const keel::u8* data, keel::usize size) noexcept {
+    if (!data || size < 12u) return 0u;
+    const keel::u32 magic =
+        (keel::as<keel::u32>(data[0]) << 24u) |
+        (keel::as<keel::u32>(data[1]) << 16u) |
+        (keel::as<keel::u32>(data[2]) << 8u) |
+        keel::as<keel::u32>(data[3]);
+    if (magic == make_tag('t', 't', 'c', 'f')) {
+        const keel::u32 numFonts =
+            (keel::as<keel::u32>(data[8]) << 24u) |
+            (keel::as<keel::u32>(data[9]) << 16u) |
+            (keel::as<keel::u32>(data[10]) << 8u) |
+            keel::as<keel::u32>(data[11]);
+        return numFonts;
+    }
+    if (magic == 0x00010000u || magic == make_tag('t', 'r', 'u', 'e') || magic == make_tag('O', 'T', 'T', 'O')) {
+        return 1u;
+    }
+    return 0u;
+}
+
+bool FontFace::load(keel::ArrayRef<keel::u8> data, keel::u32 faceIndex) noexcept {
+    return load(data.data(), data.size(), faceIndex);
+}
+
+bool FontFace::load(const keel::u8* data, keel::usize size, keel::u32 faceIndex) noexcept {
     *this = FontFace{};
     if (!data || size < 12u) {
         return false;
@@ -389,12 +690,17 @@ bool FontFace::load(const keel::u8* data, keel::usize size) noexcept {
 
     if (magic == make_tag('t', 't', 'c', 'f')) {
         keel::u32 numFonts = 0u;
-        if (!read_u32(8u, numFonts) || numFonts == 0u || !read_u32(12u, sfntOffset)) {
+        if (!read_u32(8u, numFonts) || faceIndex >= numFonts) {
+            return false;
+        }
+        if (!read_u32(12u + keel::as<keel::usize>(faceIndex) * 4u, sfntOffset)) {
             return false;
         }
         if (!read_u32(sfntOffset, magic)) {
             return false;
         }
+    } else if (faceIndex != 0u) {
+        return false;
     }
 
     const bool isTtf = (magic == 0x00010000u || magic == make_tag('t', 'r', 'u', 'e'));
@@ -409,7 +715,8 @@ bool FontFace::load(const keel::u8* data, keel::usize size) noexcept {
     }
 
     TableRecord headTbl{}, maxpTbl{}, hheaTbl{}, hmtxTbl{}, cmapTbl{};
-    TableRecord locaTbl{}, glyfTbl{}, cffTbl{}, os2Tbl{}, kernTbl{}, gposTbl{};
+    TableRecord locaTbl{}, glyfTbl{}, cffTbl{}, os2Tbl{}, postTbl{}, nameTbl{};
+    TableRecord kernTbl{}, gposTbl{}, fvarTbl{}, avarTbl{}, gvarTbl{}, hvarTbl{};
 
     const keel::usize dirStart = keel::as<keel::usize>(sfntOffset) + 12u;
     for (keel::u16 i = 0u; i < numTables; ++i) {
@@ -431,8 +738,14 @@ bool FontFace::load(const keel::u8* data, keel::usize size) noexcept {
         else if (tag == make_tag('g', 'l', 'y', 'f')) glyfTbl = rec;
         else if (tag == make_tag('C', 'F', 'F', ' ')) cffTbl = rec;
         else if (tag == make_tag('O', 'S', '/', '2')) os2Tbl = rec;
+        else if (tag == make_tag('p', 'o', 's', 't')) postTbl = rec;
+        else if (tag == make_tag('n', 'a', 'm', 'e')) nameTbl = rec;
         else if (tag == make_tag('k', 'e', 'r', 'n')) kernTbl = rec;
         else if (tag == make_tag('G', 'P', 'O', 'S')) gposTbl = rec;
+        else if (tag == make_tag('f', 'v', 'a', 'r')) fvarTbl = rec;
+        else if (tag == make_tag('a', 'v', 'a', 'r')) avarTbl = rec;
+        else if (tag == make_tag('g', 'v', 'a', 'r')) gvarTbl = rec;
+        else if (tag == make_tag('H', 'V', 'A', 'R')) hvarTbl = rec;
     }
 
     if (headTbl.length < 54u || maxpTbl.length < 6u || hheaTbl.length < 36u || hmtxTbl.length < 4u || cmapTbl.length < 4u) {
@@ -442,6 +755,9 @@ bool FontFace::load(const keel::u8* data, keel::usize size) noexcept {
     if (!read_u16(keel::as<keel::usize>(headTbl.offset) + 18u, m_unitsPerEm) || m_unitsPerEm == 0u) {
         return false;
     }
+    keel::u16 macStyle = 0u;
+    (void)read_u16(keel::as<keel::usize>(headTbl.offset) + 44u, macStyle);
+    m_isItalic = (macStyle & 0x0002u) != 0u;
     if (!read_i16(keel::as<keel::usize>(headTbl.offset) + 50u, m_indexToLocFormat)) {
         return false;
     }
@@ -450,6 +766,7 @@ bool FontFace::load(const keel::u8* data, keel::usize size) noexcept {
     }
     if (!read_i16(keel::as<keel::usize>(hheaTbl.offset) + 4u, m_ascender) ||
         !read_i16(keel::as<keel::usize>(hheaTbl.offset) + 6u, m_descender) ||
+        !read_i16(keel::as<keel::usize>(hheaTbl.offset) + 8u, m_lineGap) ||
         !read_u16(keel::as<keel::usize>(hheaTbl.offset) + 34u, m_numHMetrics) ||
         m_numHMetrics == 0u) {
         return false;
@@ -457,14 +774,37 @@ bool FontFace::load(const keel::u8* data, keel::usize size) noexcept {
 
     m_hmtxOffset = hmtxTbl.offset;
 
+    // Optional `OS/2` metadata
     m_xHeight = 0;
     m_capHeight = 0;
-    if (os2Tbl.length >= 90u) {
+    if (os2Tbl.length >= 64u) {
         keel::u16 os2Version = 0u;
-        if (read_u16(os2Tbl.offset, os2Version) && os2Version >= 2u) {
+        (void)read_u16(os2Tbl.offset, os2Version);
+        (void)read_u16(keel::as<keel::usize>(os2Tbl.offset) + 4u, m_weightClass);
+        (void)read_i16(keel::as<keel::usize>(os2Tbl.offset) + 26u, m_strikeoutSize);
+        (void)read_i16(keel::as<keel::usize>(os2Tbl.offset) + 28u, m_strikeoutPos);
+        keel::u16 fsSel = 0u;
+        if (read_u16(keel::as<keel::usize>(os2Tbl.offset) + 62u, fsSel)) {
+            if ((fsSel & 0x0001u) != 0u) m_isItalic = true;
+        }
+        if (os2Version >= 2u && os2Tbl.length >= 90u) {
             (void)read_i16(keel::as<keel::usize>(os2Tbl.offset) + 86u, m_xHeight);
             (void)read_i16(keel::as<keel::usize>(os2Tbl.offset) + 88u, m_capHeight);
         }
+    }
+
+    // Optional `post` metadata (underline metrics & monospace flag)
+    if (postTbl.length >= 16u) {
+        (void)read_i16(keel::as<keel::usize>(postTbl.offset) + 8u, m_underlinePos);
+        (void)read_i16(keel::as<keel::usize>(postTbl.offset) + 10u, m_underlineThickness);
+        keel::u32 fixedPitch = 0u;
+        if (read_u32(keel::as<keel::usize>(postTbl.offset) + 12u, fixedPitch)) {
+            m_isMonospace = (fixedPitch != 0u);
+        }
+    }
+
+    if (nameTbl.length >= 6u) {
+        (void)parse_name(nameTbl.offset, nameTbl.length);
     }
 
     if (!parse_cmap(cmapTbl.offset, cmapTbl.length)) {
@@ -494,8 +834,27 @@ bool FontFace::load(const keel::u8* data, keel::usize size) noexcept {
         (void)parse_gpos(gposTbl.offset, gposTbl.length);
     }
 
+    // Optional TrueType Variable Font tables (`fvar`, `avar`, `gvar`, `HVAR`)
+    if (fvarTbl.length >= 16u && parse_fvar(fvarTbl.offset, fvarTbl.length)) {
+        if (avarTbl.length >= 8u) {
+            (void)parse_avar(avarTbl.offset, avarTbl.length);
+        }
+        if (gvarTbl.length >= 20u) {
+            (void)parse_gvar(gvarTbl.offset, gvarTbl.length);
+        }
+        if (hvarTbl.length >= 20u) {
+            (void)parse_hvar(hvarTbl.offset, hvarTbl.length);
+        }
+    }
+
     m_valid = true;
 
+    // Populate O(1) ASCII glyph lookup cache
+    for (keel::u32 cp = 0u; cp < 128u; ++cp) {
+        m_asciiGlyphs[cp] = lookup_cmap_uncached(cp);
+    }
+
+    // Resolve blue-zone reference heights ('x', 'H', 'p')
     if (m_xHeight <= 0) {
         keel::i16 yMin = 0, yMax = 0;
         const keel::u32 gx = glyph_index(keel::as<keel::u32>('x'));
@@ -512,6 +871,16 @@ bool FontFace::load(const keel::u8* data, keel::usize size) noexcept {
             if (yMax > 0) m_capHeight = yMax;
         }
     }
+    {
+        keel::i16 yMin = 0, yMax = 0;
+        const keel::u32 gp = glyph_index(keel::as<keel::u32>('p'));
+        if (gp != 0u) {
+            compute_glyph_units_bbox(gp, yMin, yMax);
+            m_descenderBlue = (yMin < 0) ? yMin : m_descender;
+        } else {
+            m_descenderBlue = m_descender;
+        }
+    }
     if (m_capHeight <= 0) {
         m_capHeight = keel::as<keel::i16>(keel::round_i32(keel::as<keel::f32>(m_unitsPerEm) * 0.72f));
     }
@@ -522,8 +891,71 @@ bool FontFace::load(const keel::u8* data, keel::usize size) noexcept {
     return true;
 }
 
+bool FontFace::parse_name(keel::u32 offset, keel::u32 length) noexcept {
+    if (length < 6u) return false;
+    keel::u16 count = 0u, strOff = 0u;
+    if (!read_u16(keel::as<keel::usize>(offset) + 2u, count) ||
+        !read_u16(keel::as<keel::usize>(offset) + 4u, strOff)) {
+        return false;
+    }
+    const keel::usize storageBase = keel::as<keel::usize>(offset) + strOff;
+
+    keel::i32 bestFamRank = -1;
+    keel::i32 bestSubRank = -1;
+
+    auto decodeRecord = [&](keel::u16 platId, keel::u16 recOff, keel::u16 recLen, keel::SmallString<64>& out) {
+        out.clear();
+        const keel::usize start = storageBase + recOff;
+        if (start + recLen > m_size) return;
+        if (platId == 3u || platId == 0u) {
+            for (keel::u32 i = 0u; i + 1u < recLen; i += 2u) {
+                keel::u16 cu = 0u;
+                if (!read_u16(start + i, cu)) break;
+                append_utf8(out, cu);
+            }
+        } else if (platId == 1u) {
+            for (keel::u32 i = 0u; i < recLen; ++i) {
+                keel::u8 ch = 0u;
+                if (!read_u8(start + i, ch)) break;
+                if (ch >= 0x20u && ch < 0x7Fu) {
+                    append_utf8(out, ch);
+                }
+            }
+        }
+    };
+
+    for (keel::u16 i = 0u; i < count; ++i) {
+        const keel::usize r = keel::as<keel::usize>(offset) + 6u + keel::as<keel::usize>(i) * 12u;
+        keel::u16 platId = 0u, encId = 0u, langId = 0u, nameId = 0u, recLen = 0u, recOff = 0u;
+        if (!read_u16(r, platId) || !read_u16(r + 2u, encId) || !read_u16(r + 4u, langId) ||
+            !read_u16(r + 6u, nameId) || !read_u16(r + 8u, recLen) || !read_u16(r + 10u, recOff)) {
+            break;
+        }
+        if (recLen == 0u) continue;
+        if (nameId != 1u && nameId != 2u && nameId != 16u && nameId != 17u) continue;
+
+        keel::i32 rank = 0;
+        if (platId == 3u && encId == 1u && langId == 0x0409u) rank = 100;
+        else if (platId == 3u && encId == 1u) rank = 80;
+        else if (platId == 0u) rank = 70;
+        else if (platId == 1u && encId == 0u && langId == 0u) rank = 50;
+        else continue;
+
+        if (nameId == 16u || nameId == 17u) rank += 20; // Prefer typographic family/subfamily when present
+
+        if ((nameId == 1u || nameId == 16u) && rank > bestFamRank) {
+            bestFamRank = rank;
+            decodeRecord(platId, recOff, recLen, m_familyName);
+        } else if ((nameId == 2u || nameId == 17u) && rank > bestSubRank) {
+            bestSubRank = rank;
+            decodeRecord(platId, recOff, recLen, m_subfamilyName);
+        }
+    }
+    return true;
+}
+
 // ==============================================================================
-// Unicode cmap Parsing & Lookup (Format 12, 4, 6, 0)
+// Unicode cmap Parsing & Lookup (Format 12, 4, 6, 0) + O(1) ASCII LUT
 // ==============================================================================
 
 bool FontFace::parse_cmap(keel::u32 offset, keel::u32 length) noexcept {
@@ -578,7 +1010,15 @@ bool FontFace::parse_cmap(keel::u32 offset, keel::u32 length) noexcept {
 }
 
 keel::u32 FontFace::glyph_index(keel::u32 codepoint) const noexcept {
-    if (!m_valid || m_cmapSubtableOffset == 0u) {
+    if (!m_valid) return 0u;
+    if (codepoint < 128u) {
+        return m_asciiGlyphs[codepoint];
+    }
+    return lookup_cmap_uncached(codepoint);
+}
+
+keel::u32 FontFace::lookup_cmap_uncached(keel::u32 codepoint) const noexcept {
+    if (m_cmapSubtableOffset == 0u) {
         return 0u;
     }
 
@@ -678,6 +1118,628 @@ keel::u32 FontFace::glyph_index(keel::u32 codepoint) const noexcept {
     return 0u;
 }
 
+// ==============================================================================
+// Variable Fonts (`fvar`, `avar`, `gvar` with IUP, `HVAR`)
+// ==============================================================================
+
+bool FontFace::parse_fvar(keel::u32 offset, keel::u32 length) noexcept {
+    if (length < 16u) return false;
+    keel::u16 major = 0u, axesOff = 0u, axisCount = 0u, axisSize = 0u, instCount = 0u, instSize = 0u;
+    if (!read_u16(offset, major) || major != 1u ||
+        !read_u16(keel::as<keel::usize>(offset) + 4u, axesOff) ||
+        !read_u16(keel::as<keel::usize>(offset) + 8u, axisCount) ||
+        !read_u16(keel::as<keel::usize>(offset) + 10u, axisSize) ||
+        !read_u16(keel::as<keel::usize>(offset) + 12u, instCount) ||
+        !read_u16(keel::as<keel::usize>(offset) + 14u, instSize)) {
+        return false;
+    }
+    if (axisCount == 0u || axisCount > 64u || axisSize < 20u) {
+        return false;
+    }
+
+    m_axes.clear();
+    m_userCoords.clear();
+    m_normCoords.clear();
+    m_namedInstances.clear();
+
+    const keel::usize axesBase = keel::as<keel::usize>(offset) + axesOff;
+    for (keel::u16 i = 0u; i < axisCount; ++i) {
+        const keel::usize rec = axesBase + keel::as<keel::usize>(i) * axisSize;
+        keel::u32 tag = 0u;
+        keel::i32 minFx = 0, defFx = 0, maxFx = 0;
+        keel::u16 flags = 0u, nameId = 0u;
+        if (!read_u32(rec, tag) || !read_i32(rec + 4u, minFx) || !read_i32(rec + 8u, defFx) ||
+            !read_i32(rec + 12u, maxFx) || !read_u16(rec + 16u, flags) || !read_u16(rec + 18u, nameId)) {
+            m_axes.clear();
+            m_userCoords.clear();
+            m_normCoords.clear();
+            return false;
+        }
+        VariationAxis ax{};
+        ax.tag = tag;
+        ax.minValue = keel::as<keel::f32>(minFx) / 65536.0f;
+        ax.defaultValue = keel::as<keel::f32>(defFx) / 65536.0f;
+        ax.maxValue = keel::as<keel::f32>(maxFx) / 65536.0f;
+        ax.flags = flags;
+        ax.nameId = nameId;
+        m_axes.push_back(ax);
+        m_userCoords.push_back(ax.defaultValue);
+        m_normCoords.push_back(0.0f);
+    }
+
+    const keel::usize instBase = axesBase + keel::as<keel::usize>(axisCount) * axisSize;
+    if (instCount > 0u && instSize >= 4u + axisCount * 4u) {
+        for (keel::u16 i = 0u; i < instCount; ++i) {
+            const keel::usize rec = instBase + keel::as<keel::usize>(i) * instSize;
+            keel::u16 subId = 0u;
+            if (!read_u16(rec, subId)) break;
+            NamedInstance inst{};
+            inst.subfamilyNameId = subId;
+            bool ok = true;
+            for (keel::u16 a = 0u; a < axisCount; ++a) {
+                keel::i32 cFx = 0;
+                if (!read_i32(rec + 4u + keel::as<keel::usize>(a) * 4u, cFx)) {
+                    ok = false;
+                    break;
+                }
+                inst.coords.push_back(keel::as<keel::f32>(cFx) / 65536.0f);
+            }
+            if (ok) {
+                m_namedInstances.push_back(keel::move(inst));
+            }
+        }
+    }
+
+    m_hasActiveVariation = false;
+    return true;
+}
+
+bool FontFace::parse_avar(keel::u32 offset, keel::u32 length) noexcept {
+    if (length < 8u || m_axes.empty()) return false;
+    keel::u16 major = 0u, axisCount = 0u;
+    if (!read_u16(offset, major) || major != 1u ||
+        !read_u16(keel::as<keel::usize>(offset) + 6u, axisCount) ||
+        axisCount != m_axes.size()) {
+        return false;
+    }
+
+    m_avarMaps.resize(axisCount);
+    keel::usize cursor = keel::as<keel::usize>(offset) + 8u;
+    for (keel::u16 a = 0u; a < axisCount; ++a) {
+        keel::u16 mapCount = 0u;
+        if (!read_u16(cursor, mapCount)) {
+            m_avarMaps.clear();
+            return false;
+        }
+        cursor += 2u;
+        m_avarMaps[a].reserve(mapCount);
+        for (keel::u16 m = 0u; m < mapCount; ++m) {
+            keel::i16 fromC = 0, toC = 0;
+            if (!read_i16(cursor, fromC) || !read_i16(cursor + 2u, toC)) {
+                m_avarMaps.clear();
+                return false;
+            }
+            cursor += 4u;
+            m_avarMaps[a].push_back(AvarSegment{
+                keel::as<keel::f32>(fromC) / 16384.0f,
+                keel::as<keel::f32>(toC) / 16384.0f
+            });
+        }
+    }
+    return true;
+}
+
+bool FontFace::parse_gvar(keel::u32 offset, keel::u32 length) noexcept {
+    if (length < 20u) return false;
+    keel::u16 major = 0u;
+    if (!read_u16(offset, major) || major != 1u ||
+        !read_u16(keel::as<keel::usize>(offset) + 4u, m_gvarAxisCount) ||
+        !read_u16(keel::as<keel::usize>(offset) + 6u, m_gvarSharedTupleCount) ||
+        !read_u32(keel::as<keel::usize>(offset) + 8u, m_gvarSharedTuplesOffset) ||
+        !read_u16(keel::as<keel::usize>(offset) + 12u, m_gvarGlyphCount) ||
+        !read_u16(keel::as<keel::usize>(offset) + 14u, m_gvarFlags) ||
+        !read_u32(keel::as<keel::usize>(offset) + 16u, m_gvarDataArrayOffset)) {
+        return false;
+    }
+    if (m_gvarAxisCount != m_axes.size()) {
+        m_gvarOffset = 0u;
+        return false;
+    }
+    m_gvarOffset = offset;
+    m_gvarLength = length;
+    return true;
+}
+
+bool FontFace::parse_hvar(keel::u32 offset, keel::u32 length) noexcept {
+    if (length < 20u) return false;
+    keel::u16 major = 0u;
+    keel::u32 ivsRel = 0u, advMapRel = 0u;
+    if (!read_u16(offset, major) || major != 1u ||
+        !read_u32(keel::as<keel::usize>(offset) + 4u, ivsRel) ||
+        !read_u32(keel::as<keel::usize>(offset) + 8u, advMapRel) ||
+        ivsRel == 0u) {
+        return false;
+    }
+    m_hvarOffset = offset;
+    m_hvarIvsOffset = offset + ivsRel;
+    m_hvarAdvMapOffset = (advMapRel != 0u) ? (offset + advMapRel) : 0u;
+    return true;
+}
+
+keel::f32 FontFace::normalize_axis_value(keel::usize axisIdx, keel::f32 userValue) const noexcept {
+    const VariationAxis& ax = m_axes[axisIdx];
+    const keel::f32 v = keel::clamp(userValue, ax.minValue, ax.maxValue);
+    keel::f32 norm = 0.0f;
+    if (v < ax.defaultValue && ax.defaultValue > ax.minValue) {
+        norm = (v - ax.defaultValue) / (ax.defaultValue - ax.minValue);
+    } else if (v > ax.defaultValue && ax.maxValue > ax.defaultValue) {
+        norm = (v - ax.defaultValue) / (ax.maxValue - ax.defaultValue);
+    }
+
+    if (axisIdx < m_avarMaps.size() && m_avarMaps[axisIdx].size() >= 2u) {
+        const auto& segs = m_avarMaps[axisIdx];
+        if (norm <= segs[0].fromCoord) {
+            return segs[0].toCoord;
+        }
+        const keel::usize last = segs.size() - 1u;
+        if (norm >= segs[last].fromCoord) {
+            return segs[last].toCoord;
+        }
+        for (keel::usize i = 0u; i + 1u < segs.size(); ++i) {
+            if (norm >= segs[i].fromCoord && norm <= segs[i + 1u].fromCoord) {
+                const keel::f32 span = segs[i + 1u].fromCoord - segs[i].fromCoord;
+                if (span <= 1.0e-6f) return segs[i].toCoord;
+                const keel::f32 t = (norm - segs[i].fromCoord) / span;
+                return segs[i].toCoord + t * (segs[i + 1u].toCoord - segs[i].toCoord);
+            }
+        }
+    }
+    return keel::clamp(norm, -1.0f, 1.0f);
+}
+
+void FontFace::update_has_active_variation() noexcept {
+    bool active = false;
+    for (keel::usize i = 0u; i < m_normCoords.size(); ++i) {
+        if (keel::abs(m_normCoords[i]) > 1.0e-5f) {
+            active = true;
+            break;
+        }
+    }
+    m_hasActiveVariation = active;
+}
+
+bool FontFace::set_variation(keel::u32 axisTag, keel::f32 userValue) noexcept {
+    for (keel::usize i = 0u; i < m_axes.size(); ++i) {
+        if (m_axes[i].tag == axisTag) {
+            m_userCoords[i] = keel::clamp(userValue, m_axes[i].minValue, m_axes[i].maxValue);
+            m_normCoords[i] = normalize_axis_value(i, m_userCoords[i]);
+            update_has_active_variation();
+            return true;
+        }
+    }
+    return false;
+}
+
+void FontFace::set_variations(keel::ArrayRef<VariationCoord> coords) noexcept {
+    for (keel::usize i = 0u; i < coords.size(); ++i) {
+        (void)set_variation(coords[i].tag, coords[i].value);
+    }
+}
+
+bool FontFace::set_named_instance(keel::usize instanceIndex) noexcept {
+    if (instanceIndex >= m_namedInstances.size()) return false;
+    const auto& inst = m_namedInstances[instanceIndex];
+    const keel::usize n = keel::min(inst.coords.size(), m_axes.size());
+    for (keel::usize i = 0u; i < n; ++i) {
+        m_userCoords[i] = keel::clamp(inst.coords[i], m_axes[i].minValue, m_axes[i].maxValue);
+        m_normCoords[i] = normalize_axis_value(i, m_userCoords[i]);
+    }
+    update_has_active_variation();
+    return true;
+}
+
+void FontFace::reset_variations() noexcept {
+    for (keel::usize i = 0u; i < m_axes.size(); ++i) {
+        m_userCoords[i] = m_axes[i].defaultValue;
+        m_normCoords[i] = 0.0f;
+    }
+    m_hasActiveVariation = false;
+}
+
+keel::f32 FontFace::evaluate_item_variation_store(
+    keel::u32 ivsOff,
+    keel::u16 outerIdx,
+    keel::u16 innerIdx
+) const noexcept {
+    if (ivsOff == 0u) return 0.0f;
+    const keel::usize base = keel::as<keel::usize>(ivsOff);
+    keel::u16 fmt = 0u, ivdCount = 0u;
+    keel::u32 regListRel = 0u;
+    if (!read_u16(base, fmt) || fmt != 1u ||
+        !read_u32(base + 2u, regListRel) ||
+        !read_u16(base + 6u, ivdCount) ||
+        outerIdx >= ivdCount) {
+        return 0.0f;
+    }
+
+    keel::u32 ivdRel = 0u;
+    if (!read_u32(base + 8u + keel::as<keel::usize>(outerIdx) * 4u, ivdRel) || ivdRel == 0u) {
+        return 0.0f;
+    }
+    const keel::usize ivdOff = base + ivdRel;
+    keel::u16 itemCount = 0u, wordDeltaCount = 0u, regionIdxCount = 0u;
+    if (!read_u16(ivdOff, itemCount) || !read_u16(ivdOff + 2u, wordDeltaCount) ||
+        !read_u16(ivdOff + 4u, regionIdxCount) || innerIdx >= itemCount) {
+        return 0.0f;
+    }
+
+    const bool longWords = (wordDeltaCount & 0x8000u) != 0u;
+    const keel::u16 shortCount = wordDeltaCount & 0x7FFFu;
+    if (shortCount > regionIdxCount) return 0.0f;
+
+    const keel::usize regListBase = base + regListRel;
+    keel::u16 regAxisCount = 0u, regCount = 0u;
+    if (!read_u16(regListBase, regAxisCount) || !read_u16(regListBase + 2u, regCount) ||
+        regAxisCount != m_normCoords.size()) {
+        return 0.0f;
+    }
+
+    const keel::usize regionIdxsOff = ivdOff + 6u;
+    const keel::usize deltaSetOff = regionIdxsOff + keel::as<keel::usize>(regionIdxCount) * 2u;
+    const keel::usize rowBytes = longWords
+        ? (keel::as<keel::usize>(shortCount) * 4u + keel::as<keel::usize>(regionIdxCount - shortCount) * 2u)
+        : (keel::as<keel::usize>(shortCount) * 2u + keel::as<keel::usize>(regionIdxCount - shortCount));
+    keel::usize rowPos = deltaSetOff + keel::as<keel::usize>(innerIdx) * rowBytes;
+
+    keel::f32 totalDelta = 0.0f;
+    for (keel::u16 r = 0u; r < regionIdxCount; ++r) {
+        keel::i32 delta = 0;
+        if (longWords) {
+            if (r < shortCount) {
+                if (!read_i32(rowPos, delta)) break;
+                rowPos += 4u;
+            } else {
+                keel::i16 d16 = 0;
+                if (!read_i16(rowPos, d16)) break;
+                delta = d16;
+                rowPos += 2u;
+            }
+        } else {
+            if (r < shortCount) {
+                keel::i16 d16 = 0;
+                if (!read_i16(rowPos, d16)) break;
+                delta = d16;
+                rowPos += 2u;
+            } else {
+                keel::u8 d8 = 0u;
+                if (!read_u8(rowPos++, d8)) break;
+                delta = keel::as<keel::i8>(d8);
+            }
+        }
+        if (delta == 0) continue;
+
+        keel::u16 regIdx = 0u;
+        if (!read_u16(regionIdxsOff + keel::as<keel::usize>(r) * 2u, regIdx) || regIdx >= regCount) continue;
+
+        const keel::usize regOff = regListBase + 4u + keel::as<keel::usize>(regIdx) * keel::as<keel::usize>(regAxisCount) * 6u;
+        keel::f32 scalar = 1.0f;
+        for (keel::u16 a = 0u; a < regAxisCount; ++a) {
+            keel::i16 s14 = 0, p14 = 0, e14 = 0;
+            const keel::usize axOff = regOff + keel::as<keel::usize>(a) * 6u;
+            if (!read_i16(axOff, s14) || !read_i16(axOff + 2u, p14) || !read_i16(axOff + 4u, e14)) {
+                scalar = 0.0f;
+                break;
+            }
+            const keel::f32 start = keel::as<keel::f32>(s14) / 16384.0f;
+            const keel::f32 peak = keel::as<keel::f32>(p14) / 16384.0f;
+            const keel::f32 end = keel::as<keel::f32>(e14) / 16384.0f;
+            const keel::f32 v = m_normCoords[a];
+
+            if (peak == 0.0f) continue;
+            if (start > peak || peak > end || (start < 0.0f && end > 0.0f)) continue;
+            if (v == peak) continue;
+            if (v <= start || v >= end) {
+                scalar = 0.0f;
+                break;
+            }
+            if (v < peak) {
+                scalar *= (v - start) / (peak - start);
+            } else {
+                scalar *= (end - v) / (end - peak);
+            }
+        }
+        totalDelta += keel::as<keel::f32>(delta) * scalar;
+    }
+    return totalDelta;
+}
+
+keel::f32 FontFace::evaluate_hvar_advance_delta(keel::u32 glyphIndex) const noexcept {
+    if (!m_hasActiveVariation || m_hvarIvsOffset == 0u) return 0.0f;
+
+    keel::u16 outerIdx = 0u;
+    keel::u16 innerIdx = keel::as<keel::u16>(glyphIndex);
+
+    if (m_hvarAdvMapOffset != 0u) {
+        const keel::usize mapOff = keel::as<keel::usize>(m_hvarAdvMapOffset);
+        keel::u8 fmt = 0u, entryFmt = 0u;
+        if (!read_u8(mapOff, fmt) || !read_u8(mapOff + 1u, entryFmt)) return 0.0f;
+
+        keel::u32 mapCount = 0u;
+        keel::usize entriesOff = 0u;
+        if (fmt == 0u) {
+            keel::u16 mc16 = 0u;
+            if (!read_u16(mapOff + 2u, mc16)) return 0.0f;
+            mapCount = mc16;
+            entriesOff = mapOff + 4u;
+        } else if (fmt == 1u) {
+            if (!read_u32(mapOff + 2u, mapCount)) return 0.0f;
+            entriesOff = mapOff + 6u;
+        } else {
+            return 0.0f;
+        }
+        if (mapCount == 0u) return 0.0f;
+
+        const keel::u32 innerBits = keel::as<keel::u32>(entryFmt & 0x0Fu) + 1u;
+        const keel::u32 entrySize = keel::as<keel::u32>((entryFmt >> 4u) & 0x03u) + 1u;
+        const keel::u32 clampedGid = (glyphIndex < mapCount) ? glyphIndex : (mapCount - 1u);
+        const keel::usize pos = entriesOff + keel::as<keel::usize>(clampedGid) * entrySize;
+        keel::u32 val = 0u;
+        for (keel::u32 b = 0u; b < entrySize; ++b) {
+            keel::u8 byte = 0u;
+            if (!read_u8(pos + b, byte)) return 0.0f;
+            val = (val << 8u) | byte;
+        }
+        outerIdx = keel::as<keel::u16>(val >> innerBits);
+        innerIdx = keel::as<keel::u16>(val & ((1u << innerBits) - 1u));
+    }
+
+    return evaluate_item_variation_store(m_hvarIvsOffset, outerIdx, innerIdx);
+}
+
+void FontFace::apply_gvar_deltas(
+    keel::u32 glyphIndex,
+    const keel::Array<keel::i32>& origX,
+    const keel::Array<keel::i32>& origY,
+    const keel::Array<keel::u16>& endPts,
+    keel::u32 numPts,
+    RasterScratch& scratch
+) const noexcept {
+    const keel::u32 totalPts = numPts + 4u; // + 4 phantom points
+    scratch.varDeltaX.assign(totalPts, 0.0f);
+    scratch.varDeltaY.assign(totalPts, 0.0f);
+
+    if (!m_hasActiveVariation || m_gvarOffset == 0u || glyphIndex >= m_gvarGlyphCount) {
+        return;
+    }
+
+    const keel::usize gvarBase = keel::as<keel::usize>(m_gvarOffset);
+    keel::u32 d0 = 0u, d1 = 0u;
+    if ((m_gvarFlags & 0x0001u) == 0u) {
+        keel::u16 w0 = 0u, w1 = 0u;
+        const keel::usize offPos = gvarBase + 20u + keel::as<keel::usize>(glyphIndex) * 2u;
+        if (!read_u16(offPos, w0) || !read_u16(offPos + 2u, w1)) return;
+        d0 = keel::as<keel::u32>(w0) * 2u;
+        d1 = keel::as<keel::u32>(w1) * 2u;
+    } else {
+        const keel::usize offPos = gvarBase + 20u + keel::as<keel::usize>(glyphIndex) * 4u;
+        if (!read_u32(offPos, d0) || !read_u32(offPos + 4u, d1)) return;
+    }
+    if (d1 <= d0) return;
+
+    const keel::usize gDataStart = gvarBase + m_gvarDataArrayOffset + d0;
+    const keel::usize gDataEnd = gvarBase + m_gvarDataArrayOffset + d1;
+    if (gDataEnd > m_size || gDataStart + 4u > gDataEnd) return;
+
+    keel::u16 tupleVarCountWord = 0u, serRel = 0u;
+    if (!read_u16(gDataStart, tupleVarCountWord) || !read_u16(gDataStart + 2u, serRel)) return;
+
+    const keel::u16 tupleCount = tupleVarCountWord & 0x0FFFu;
+    const bool hasSharedPoints = (tupleVarCountWord & 0x8000u) != 0u;
+    keel::usize hdrCursor = gDataStart + 4u;
+    keel::usize serCursor = gDataStart + serRel;
+    if (serCursor > gDataEnd) return;
+
+    auto readPackedPointNumbers = [&](keel::usize& pos, keel::usize limit, keel::Array<keel::u32>& outPts, bool& outAll) -> bool {
+        outPts.clear();
+        outAll = false;
+        if (pos >= limit) return false;
+        keel::u8 b0 = 0u;
+        if (!read_u8(pos++, b0)) return false;
+        if (b0 == 0u) {
+            outAll = true;
+            return true;
+        }
+        keel::u32 count = b0;
+        if ((b0 & 0x80u) != 0u) {
+            keel::u8 b1 = 0u;
+            if (pos >= limit || !read_u8(pos++, b1)) return false;
+            count = (keel::as<keel::u32>(b0 & 0x7Fu) << 8u) | b1;
+        }
+        outPts.reserve(count);
+        keel::u32 curPt = 0u;
+        while (outPts.size() < count && pos < limit) {
+            keel::u8 ctrl = 0u;
+            if (!read_u8(pos++, ctrl)) return false;
+            const bool is16 = (ctrl & 0x80u) != 0u;
+            const keel::u32 run = keel::as<keel::u32>(ctrl & 0x7Fu) + 1u;
+            for (keel::u32 r = 0u; r < run && outPts.size() < count; ++r) {
+                if (is16) {
+                    keel::u16 d16 = 0u;
+                    if (pos + 2u > limit || !read_u16(pos, d16)) return false;
+                    pos += 2u;
+                    curPt += d16;
+                } else {
+                    keel::u8 d8 = 0u;
+                    if (pos >= limit || !read_u8(pos++, d8)) return false;
+                    curPt += d8;
+                }
+                outPts.push_back(curPt);
+            }
+        }
+        return true;
+    };
+
+    auto readPackedDeltas = [&](keel::usize& pos, keel::usize limit, keel::u32 count, keel::Array<keel::f32>& dst, const keel::Array<keel::u32>& ptIdxs, bool allPts) -> bool {
+        keel::u32 decoded = 0u;
+        while (decoded < count && pos < limit) {
+            keel::u8 ctrl = 0u;
+            if (!read_u8(pos++, ctrl)) return false;
+            const keel::u32 run = keel::as<keel::u32>(ctrl & 0x3Fu) + 1u;
+            const bool isZero = (ctrl & 0x80u) != 0u;
+            const bool isWord = (ctrl & 0x40u) != 0u;
+            for (keel::u32 r = 0u; r < run && decoded < count; ++r) {
+                keel::i32 val = 0;
+                if (!isZero) {
+                    if (isWord) {
+                        keel::i16 v16 = 0;
+                        if (pos + 2u > limit || !read_i16(pos, v16)) return false;
+                        pos += 2u;
+                        val = v16;
+                    } else {
+                        keel::u8 v8 = 0u;
+                        if (pos >= limit || !read_u8(pos++, v8)) return false;
+                        val = keel::as<keel::i8>(v8);
+                    }
+                }
+                const keel::u32 targetIdx = allPts ? decoded : ptIdxs[decoded];
+                if (targetIdx < totalPts) {
+                    dst[targetIdx] = keel::as<keel::f32>(val);
+                }
+                ++decoded;
+            }
+        }
+        return true;
+    };
+
+    keel::Array<keel::u32> sharedPts;
+    bool sharedAll = true;
+    if (hasSharedPoints) {
+        if (!readPackedPointNumbers(serCursor, gDataEnd, sharedPts, sharedAll)) return;
+    }
+
+    const keel::usize axisCount = m_normCoords.size();
+    keel::SmallArray<keel::f32, 8> peakTuple;
+    keel::SmallArray<keel::f32, 8> startTuple;
+    keel::SmallArray<keel::f32, 8> endTuple;
+
+    for (keel::u16 t = 0u; t < tupleCount; ++t) {
+        keel::u16 varDataSize = 0u, tupleIdxWord = 0u;
+        if (hdrCursor + 4u > gDataEnd || !read_u16(hdrCursor, varDataSize) || !read_u16(hdrCursor + 2u, tupleIdxWord)) {
+            break;
+        }
+        hdrCursor += 4u;
+
+        const bool embeddedPeak = (tupleIdxWord & 0x8000u) != 0u;
+        const bool hasInterm = (tupleIdxWord & 0x4000u) != 0u;
+        const bool privatePts = (tupleIdxWord & 0x2000u) != 0u;
+        const keel::u16 sharedIdx = tupleIdxWord & 0x0FFFu;
+
+        peakTuple.clear();
+        if (embeddedPeak) {
+            for (keel::usize a = 0u; a < axisCount; ++a) {
+                keel::i16 p14 = 0;
+                if (!read_i16(hdrCursor, p14)) return;
+                hdrCursor += 2u;
+                peakTuple.push_back(keel::as<keel::f32>(p14) / 16384.0f);
+            }
+        } else {
+            if (sharedIdx >= m_gvarSharedTupleCount) {
+                serCursor += varDataSize;
+                continue;
+            }
+            const keel::usize sOff = gvarBase + m_gvarSharedTuplesOffset + keel::as<keel::usize>(sharedIdx) * axisCount * 2u;
+            for (keel::usize a = 0u; a < axisCount; ++a) {
+                keel::i16 p14 = 0;
+                if (!read_i16(sOff + a * 2u, p14)) return;
+                peakTuple.push_back(keel::as<keel::f32>(p14) / 16384.0f);
+            }
+        }
+
+        startTuple.clear();
+        endTuple.clear();
+        if (hasInterm) {
+            for (keel::usize a = 0u; a < axisCount; ++a) {
+                keel::i16 s14 = 0;
+                if (!read_i16(hdrCursor, s14)) return;
+                hdrCursor += 2u;
+                startTuple.push_back(keel::as<keel::f32>(s14) / 16384.0f);
+            }
+            for (keel::usize a = 0u; a < axisCount; ++a) {
+                keel::i16 e14 = 0;
+                if (!read_i16(hdrCursor, e14)) return;
+                hdrCursor += 2u;
+                endTuple.push_back(keel::as<keel::f32>(e14) / 16384.0f);
+            }
+        }
+
+        const keel::usize tupleSerStart = serCursor;
+        const keel::usize tupleSerEnd = keel::min(serCursor + varDataSize, gDataEnd);
+        serCursor = tupleSerEnd;
+
+        // Compute tuple scalar weight
+        keel::f32 scalar = 1.0f;
+        for (keel::usize a = 0u; a < axisCount; ++a) {
+            const keel::f32 p = peakTuple[a];
+            const keel::f32 v = m_normCoords[a];
+            if (p == 0.0f) continue;
+            const keel::f32 start = hasInterm ? startTuple[a] : keel::min(0.0f, p);
+            const keel::f32 end = hasInterm ? endTuple[a] : keel::max(0.0f, p);
+            if (v == p) continue;
+            if (v == 0.0f || v <= start || v >= end) {
+                scalar = 0.0f;
+                break;
+            }
+            if (v < p) {
+                scalar *= (v - start) / (p - start);
+            } else {
+                scalar *= (end - v) / (end - p);
+            }
+        }
+        if (scalar == 0.0f) continue;
+
+        keel::usize pos = tupleSerStart;
+        bool allPts = sharedAll;
+        const keel::Array<keel::u32>* activePts = &sharedPts;
+        if (privatePts) {
+            if (!readPackedPointNumbers(pos, tupleSerEnd, scratch.varPointIndices, allPts)) continue;
+            activePts = &scratch.varPointIndices;
+        }
+
+        const keel::u32 deltaCount = allPts ? totalPts : keel::as<keel::u32>(activePts->size());
+        scratch.tupleDeltaX.assign(totalPts, 0.0f);
+        scratch.tupleDeltaY.assign(totalPts, 0.0f);
+
+        if (!readPackedDeltas(pos, tupleSerEnd, deltaCount, scratch.tupleDeltaX, *activePts, allPts)) continue;
+        if (!readPackedDeltas(pos, tupleSerEnd, deltaCount, scratch.tupleDeltaY, *activePts, allPts)) continue;
+
+        // Interpolate untouched contour points (IUP) when a sparse point set was supplied
+        if (!allPts && numPts > 0u) {
+            scratch.varTouched.assign(numPts, 0u);
+            for (keel::usize i = 0u; i < activePts->size(); ++i) {
+                const keel::u32 idx = (*activePts)[i];
+                if (idx < numPts) scratch.varTouched[idx] = 1u;
+            }
+            keel::u32 startIdx = 0u;
+            for (keel::usize c = 0u; c < endPts.size(); ++c) {
+                const keel::u32 endIdx = endPts[c];
+                if (endIdx >= numPts || endIdx < startIdx) break;
+                apply_iup_axis(origX, scratch.tupleDeltaX, scratch.varTouched, startIdx, endIdx);
+                apply_iup_axis(origY, scratch.tupleDeltaY, scratch.varTouched, startIdx, endIdx);
+                startIdx = endIdx + 1u;
+            }
+        }
+
+        for (keel::u32 i = 0u; i < totalPts; ++i) {
+            scratch.varDeltaX[i] += scratch.tupleDeltaX[i] * scalar;
+            scratch.varDeltaY[i] += scratch.tupleDeltaY[i] * scalar;
+        }
+    }
+}
+
+// ==============================================================================
+// Unrasterized Metrics & Kerning
+// ==============================================================================
+
 keel::u16 FontFace::advance_width_units(keel::u32 glyphIndex) const noexcept {
     if (!m_valid || m_hmtxOffset == 0u || m_numHMetrics == 0u) {
         return m_unitsPerEm / 2u;
@@ -687,7 +1749,125 @@ keel::u16 FontFace::advance_width_units(keel::u32 glyphIndex) const noexcept {
     if (!read_u16(keel::as<keel::usize>(m_hmtxOffset) + keel::as<keel::usize>(clamped) * 4u, adv)) {
         return m_unitsPerEm / 2u;
     }
+    if (m_hasActiveVariation && m_hvarIvsOffset != 0u) {
+        const keel::i32 adj = keel::as<keel::i32>(adv) + keel::round_i32(evaluate_hvar_advance_delta(glyphIndex));
+        return keel::as<keel::u16>(keel::clamp(adj, 0, 65535));
+    }
     return adv;
+}
+
+keel::i16 FontFace::left_side_bearing_units(keel::u32 glyphIndex) const noexcept {
+    if (!m_valid || m_hmtxOffset == 0u || m_numHMetrics == 0u) {
+        return 0;
+    }
+    keel::i16 lsb = 0;
+    if (glyphIndex < m_numHMetrics) {
+        (void)read_i16(keel::as<keel::usize>(m_hmtxOffset) + keel::as<keel::usize>(glyphIndex) * 4u + 2u, lsb);
+    } else {
+        const keel::usize tailOff = keel::as<keel::usize>(m_hmtxOffset) +
+                                    keel::as<keel::usize>(m_numHMetrics) * 4u +
+                                    keel::as<keel::usize>(glyphIndex - m_numHMetrics) * 2u;
+        (void)read_i16(tailOff, lsb);
+    }
+    return lsb;
+}
+
+keel::f32 FontFace::advance_width_px(
+    keel::u32 glyphIndex,
+    keel::f32 fontSizePx,
+    Hinting hinting,
+    bool syntheticBold
+) const noexcept {
+    if (!m_valid || fontSizePx <= 0.0f || m_unitsPerEm == 0u) {
+        return 0.0f;
+    }
+    const keel::f32 scale = fontSizePx / keel::as<keel::f32>(m_unitsPerEm);
+    keel::f32 advPx = keel::as<keel::f32>(advance_width_units(glyphIndex)) * scale;
+    if (hinting == Hinting::Normal) {
+        advPx = keel::round(advPx);
+    }
+    if (syntheticBold) {
+        advPx += 0.35f;
+    }
+    return advPx;
+}
+
+keel::f32 FontFace::kerning_px(
+    keel::u32 leftGlyph,
+    keel::u32 rightGlyph,
+    keel::f32 fontSizePx,
+    Hinting hinting
+) const noexcept {
+    if (!m_valid || fontSizePx <= 0.0f || m_unitsPerEm == 0u) {
+        return 0.0f;
+    }
+    const keel::i32 units = kerning_units(leftGlyph, rightGlyph);
+    if (units == 0) return 0.0f;
+    const keel::f32 px = keel::as<keel::f32>(units) * (fontSizePx / keel::as<keel::f32>(m_unitsPerEm));
+    return (hinting == Hinting::Normal) ? keel::round(px) : px;
+}
+
+bool FontFace::glyph_metrics(
+    keel::u32 glyphIndex,
+    keel::f32 fontSizePx,
+    Hinting hinting,
+    GlyphMetrics& out
+) const {
+    out = GlyphMetrics{};
+    if (!m_valid || fontSizePx <= 0.0f || m_unitsPerEm == 0u) {
+        return false;
+    }
+    const keel::f32 scale = fontSizePx / keel::as<keel::f32>(m_unitsPerEm);
+    out.advancePx = advance_width_px(glyphIndex, fontSizePx, hinting, false);
+    out.lsbPx = keel::as<keel::f32>(left_side_bearing_units(glyphIndex)) * scale;
+
+    if (!m_isCff && !m_hasActiveVariation) {
+        keel::u32 gOff = 0u, gLen = 0u;
+        if (get_glyph_byte_range(glyphIndex, gOff, gLen) && gLen >= 10u) {
+            keel::i16 x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+            if (read_i16(keel::as<keel::usize>(gOff) + 2u, x0) &&
+                read_i16(keel::as<keel::usize>(gOff) + 4u, y0) &&
+                read_i16(keel::as<keel::usize>(gOff) + 6u, x1) &&
+                read_i16(keel::as<keel::usize>(gOff) + 8u, y1)) {
+                const Transform2D xf = make_transform(fontSizePx, RasterOptions{.hinting = hinting});
+                out.minX = keel::as<keel::f32>(x0) * scale;
+                out.maxX = keel::as<keel::f32>(x1) * scale;
+                out.minY = -xf.transform_y_up(keel::as<keel::f32>(y1));
+                out.maxY = -xf.transform_y_up(keel::as<keel::f32>(y0));
+                out.empty = (out.maxX <= out.minX || out.maxY <= out.minY);
+                return true;
+            }
+        }
+        out.empty = true;
+        return true;
+    }
+
+    // Variable TTF or CFF: compute exact bbox from outline segments
+    RasterScratch localScratch;
+    OutlineBuilder ob{};
+    ob.segments = &localScratch.segments;
+    const Transform2D xf = make_transform(fontSizePx, RasterOptions{.hinting = hinting});
+    const bool ok = m_isCff
+        ? extract_cff_glyph_outline(glyphIndex, xf, 0.5f, ob)
+        : extract_ttf_glyph_outline(glyphIndex, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, xf, 0.5f, 0u, ob, localScratch);
+    if (!ok || localScratch.segments.empty()) {
+        out.empty = true;
+        return true;
+    }
+    keel::f32 minX = 1.0e9f, maxX = -1.0e9f, minY = 1.0e9f, maxY = -1.0e9f;
+    for (keel::usize i = 0u; i < localScratch.segments.size(); ++i) {
+        const auto& s = localScratch.segments[i];
+        minX = keel::min(minX, keel::min(s.x0, s.x1));
+        maxX = keel::max(maxX, keel::max(s.x0, s.x1));
+        minY = keel::min(minY, keel::min(s.y0, s.y1));
+        maxY = keel::max(maxY, keel::max(s.y0, s.y1));
+    }
+    out.minX = minX;
+    out.maxX = maxX;
+    out.minY = minY;
+    out.maxY = maxY;
+    out.empty = (maxX <= minX || maxY <= minY);
+    return true;
 }
 
 // ==============================================================================
@@ -964,7 +2144,7 @@ keel::i32 FontFace::kerning_units(keel::u32 leftGlyph, keel::u32 rightGlyph) con
 }
 
 // ==============================================================================
-// TrueType `loca` + `glyf` Outline Extraction (Simple + Composite Glyphs)
+// TrueType `loca` + `glyf` Outline Extraction (Simple + Composite + `gvar`)
 // ==============================================================================
 
 bool FontFace::get_glyph_byte_range(keel::u32 glyphIndex, keel::u32& outOff, keel::u32& outLen) const noexcept {
@@ -1002,6 +2182,7 @@ bool FontFace::extract_ttf_glyph_outline(
     keel::f32 flatness,
     keel::u32 depth,
     OutlineBuilder& out,
+    RasterScratch& scratch,
     keel::Array<keel::f32>* outPointsX,
     keel::Array<keel::f32>* outPointsY
 ) const {
@@ -1021,10 +2202,9 @@ bool FontFace::extract_ttf_glyph_outline(
         const keel::u32 numPts = keel::as<keel::u32>(lastEndPt) + 1u;
         if (numPts == 0u || numPts > 32768u) return false;
 
-        keel::Array<keel::u16> endPts;
-        endPts.resize(keel::as<keel::usize>(numContours));
+        scratch.endPts.resize(keel::as<keel::usize>(numContours));
         for (keel::i16 c = 0; c < numContours; ++c) {
-            if (!read_u16(endPtsOff + keel::as<keel::usize>(c) * 2u, endPts[keel::as<keel::usize>(c)])) return false;
+            if (!read_u16(endPtsOff + keel::as<keel::usize>(c) * 2u, scratch.endPts[keel::as<keel::usize>(c)])) return false;
         }
 
         keel::usize cursor = endPtsOff + keel::as<keel::usize>(numContours) * 2u;
@@ -1032,30 +2212,27 @@ bool FontFace::extract_ttf_glyph_outline(
         if (!read_u16(cursor, instrLen)) return false;
         cursor += 2u + keel::as<keel::usize>(instrLen);
 
-        keel::Array<keel::u8> flags;
-        flags.resize(numPts);
+        scratch.flags.resize(numPts);
         keel::u32 p = 0u;
         while (p < numPts) {
             keel::u8 fl = 0u;
             if (!read_u8(cursor++, fl)) return false;
-            flags[p++] = fl;
+            scratch.flags[p++] = fl;
             if ((fl & 0x08u) != 0u) {
                 keel::u8 rep = 0u;
                 if (!read_u8(cursor++, rep)) return false;
                 for (keel::u32 r = 0u; r < rep && p < numPts; ++r) {
-                    flags[p++] = fl;
+                    scratch.flags[p++] = fl;
                 }
             }
         }
 
-        keel::Array<keel::i32> rawX;
-        keel::Array<keel::i32> rawY;
-        rawX.resize(numPts);
-        rawY.resize(numPts);
+        scratch.rawX.resize(numPts);
+        scratch.rawY.resize(numPts);
 
         keel::i32 curX = 0;
         for (keel::u32 i = 0u; i < numPts; ++i) {
-            const keel::u8 fl = flags[i];
+            const keel::u8 fl = scratch.flags[i];
             if ((fl & 0x02u) != 0u) {
                 keel::u8 dx = 0u;
                 if (!read_u8(cursor++, dx)) return false;
@@ -1066,12 +2243,12 @@ bool FontFace::extract_ttf_glyph_outline(
                 cursor += 2u;
                 curX += dx;
             }
-            rawX[i] = curX;
+            scratch.rawX[i] = curX;
         }
 
         keel::i32 curY = 0;
         for (keel::u32 i = 0u; i < numPts; ++i) {
-            const keel::u8 fl = flags[i];
+            const keel::u8 fl = scratch.flags[i];
             if ((fl & 0x04u) != 0u) {
                 keel::u8 dy = 0u;
                 if (!read_u8(cursor++, dy)) return false;
@@ -1082,16 +2259,19 @@ bool FontFace::extract_ttf_glyph_outline(
                 cursor += 2u;
                 curY += dy;
             }
-            rawY[i] = curY;
+            scratch.rawY[i] = curY;
         }
 
-        keel::Array<keel::f32> ptsX;
-        keel::Array<keel::f32> ptsY;
-        ptsX.resize(numPts);
-        ptsY.resize(numPts);
+        const bool applyVar = m_hasActiveVariation && (m_gvarOffset != 0u);
+        if (applyVar) {
+            apply_gvar_deltas(glyphIndex, scratch.rawX, scratch.rawY, scratch.endPts, numPts, scratch);
+        }
+
+        scratch.ptsX.resize(numPts);
+        scratch.ptsY.resize(numPts);
         for (keel::u32 i = 0u; i < numPts; ++i) {
-            const keel::f32 ux = keel::as<keel::f32>(rawX[i]);
-            const keel::f32 uy = keel::as<keel::f32>(rawY[i]);
+            const keel::f32 ux = keel::as<keel::f32>(scratch.rawX[i]) + (applyVar ? scratch.varDeltaX[i] : 0.0f);
+            const keel::f32 uy = keel::as<keel::f32>(scratch.rawY[i]) + (applyVar ? scratch.varDeltaY[i] : 0.0f);
             const keel::f32 fx = m00 * ux + m01 * uy + tx;
             const keel::f32 fy = m10 * ux + m11 * uy + ty;
             if (outPointsX && outPointsY) {
@@ -1099,13 +2279,17 @@ bool FontFace::extract_ttf_glyph_outline(
                 outPointsY->push_back(fy);
             }
             const keel::f32 pyUp = xf.transform_y_up(fy);
-            ptsX[i] = xf.transform_x(fx, pyUp);
-            ptsY[i] = -pyUp;
+            scratch.ptsX[i] = xf.transform_x(fx, pyUp);
+            scratch.ptsY[i] = -pyUp;
+        }
+
+        if (xf.hint.snapStems && depth == 0u) {
+            apply_horizontal_stem_snapping(scratch.ptsX, scratch.ptsY, scratch.flags, scratch.endPts, xf.hint);
         }
 
         keel::u32 startIdx = 0u;
         for (keel::i16 c = 0; c < numContours; ++c) {
-            const keel::u32 endIdx = endPts[keel::as<keel::usize>(c)];
+            const keel::u32 endIdx = scratch.endPts[keel::as<keel::usize>(c)];
             if (endIdx >= numPts || endIdx < startIdx) break;
             const keel::u32 count = endIdx - startIdx + 1u;
             if (count < 2u) {
@@ -1114,13 +2298,13 @@ bool FontFace::extract_ttf_glyph_outline(
             }
 
             auto isOn = [&](keel::u32 idx) noexcept -> bool {
-                return (flags[startIdx + (idx % count)] & 0x01u) != 0u;
+                return (scratch.flags[startIdx + (idx % count)] & 0x01u) != 0u;
             };
             auto px = [&](keel::u32 idx) noexcept -> keel::f32 {
-                return ptsX[startIdx + (idx % count)];
+                return scratch.ptsX[startIdx + (idx % count)];
             };
             auto py = [&](keel::u32 idx) noexcept -> keel::f32 {
-                return ptsY[startIdx + (idx % count)];
+                return scratch.ptsY[startIdx + (idx % count)];
             };
 
             keel::f32 sx = 0.0f, sy = 0.0f;
@@ -1189,89 +2373,113 @@ bool FontFace::extract_ttf_glyph_outline(
         constexpr keel::u16 kWeHaveAnXAndYScale = 0x0040u;
         constexpr keel::u16 kWeHaveATwoByTwo = 0x0080u;
 
+        // First count components to support composite `gvar` component offset deltas when active
+        struct CompDesc {
+            keel::u16 flags{0u};
+            keel::u16 gid{0u};
+            keel::i32 arg1{0};
+            keel::i32 arg2{0};
+            keel::f32 cm00{1.0f}, cm01{0.0f}, cm10{0.0f}, cm11{1.0f};
+        };
+        keel::SmallArray<CompDesc, 8> comps;
         bool more = true;
-        while (more) {
-            keel::u16 cFlags = 0u, compGid = 0u;
-            if (!read_u16(cursor, cFlags) || !read_u16(cursor + 2u, compGid)) return false;
+        while (more && comps.size() < 64u) {
+            CompDesc cd{};
+            if (!read_u16(cursor, cd.flags) || !read_u16(cursor + 2u, cd.gid)) return false;
             cursor += 4u;
 
-            keel::i32 arg1 = 0, arg2 = 0;
-            if ((cFlags & kArg1And2AreWords) != 0u) {
-                if ((cFlags & kArgsAreXYValues) != 0u) {
+            if ((cd.flags & kArg1And2AreWords) != 0u) {
+                if ((cd.flags & kArgsAreXYValues) != 0u) {
                     keel::i16 a1 = 0, a2 = 0;
                     if (!read_i16(cursor, a1) || !read_i16(cursor + 2u, a2)) return false;
-                    arg1 = a1; arg2 = a2;
+                    cd.arg1 = a1; cd.arg2 = a2;
                 } else {
                     keel::u16 a1 = 0u, a2 = 0u;
                     if (!read_u16(cursor, a1) || !read_u16(cursor + 2u, a2)) return false;
-                    arg1 = a1; arg2 = a2;
+                    cd.arg1 = a1; cd.arg2 = a2;
                 }
                 cursor += 4u;
             } else {
-                if ((cFlags & kArgsAreXYValues) != 0u) {
+                if ((cd.flags & kArgsAreXYValues) != 0u) {
                     keel::u8 b1 = 0u, b2 = 0u;
                     if (!read_u8(cursor, b1) || !read_u8(cursor + 1u, b2)) return false;
-                    arg1 = keel::as<keel::i8>(b1);
-                    arg2 = keel::as<keel::i8>(b2);
+                    cd.arg1 = keel::as<keel::i8>(b1);
+                    cd.arg2 = keel::as<keel::i8>(b2);
                 } else {
                     keel::u8 b1 = 0u, b2 = 0u;
                     if (!read_u8(cursor, b1) || !read_u8(cursor + 1u, b2)) return false;
-                    arg1 = b1; arg2 = b2;
+                    cd.arg1 = b1; cd.arg2 = b2;
                 }
                 cursor += 2u;
             }
 
-            keel::f32 cm00 = 1.0f, cm01 = 0.0f, cm10 = 0.0f, cm11 = 1.0f;
-            if ((cFlags & kWeHaveAScale) != 0u) {
+            if ((cd.flags & kWeHaveAScale) != 0u) {
                 keel::i16 s = 0;
                 if (!read_i16(cursor, s)) return false;
                 cursor += 2u;
-                cm00 = cm11 = keel::as<keel::f32>(s) / 16384.0f;
-            } else if ((cFlags & kWeHaveAnXAndYScale) != 0u) {
+                cd.cm00 = cd.cm11 = keel::as<keel::f32>(s) / 16384.0f;
+            } else if ((cd.flags & kWeHaveAnXAndYScale) != 0u) {
                 keel::i16 sx = 0, sy = 0;
                 if (!read_i16(cursor, sx) || !read_i16(cursor + 2u, sy)) return false;
                 cursor += 4u;
-                cm00 = keel::as<keel::f32>(sx) / 16384.0f;
-                cm11 = keel::as<keel::f32>(sy) / 16384.0f;
-            } else if ((cFlags & kWeHaveATwoByTwo) != 0u) {
+                cd.cm00 = keel::as<keel::f32>(sx) / 16384.0f;
+                cd.cm11 = keel::as<keel::f32>(sy) / 16384.0f;
+            } else if ((cd.flags & kWeHaveATwoByTwo) != 0u) {
                 keel::i16 a = 0, b = 0, c = 0, d = 0;
                 if (!read_i16(cursor, a) || !read_i16(cursor + 2u, b) ||
                     !read_i16(cursor + 4u, c) || !read_i16(cursor + 6u, d)) return false;
                 cursor += 8u;
-                cm00 = keel::as<keel::f32>(a) / 16384.0f;
-                cm10 = keel::as<keel::f32>(b) / 16384.0f;
-                cm01 = keel::as<keel::f32>(c) / 16384.0f;
-                cm11 = keel::as<keel::f32>(d) / 16384.0f;
+                cd.cm00 = keel::as<keel::f32>(a) / 16384.0f;
+                cd.cm10 = keel::as<keel::f32>(b) / 16384.0f;
+                cd.cm01 = keel::as<keel::f32>(c) / 16384.0f;
+                cd.cm11 = keel::as<keel::f32>(d) / 16384.0f;
             }
 
+            comps.push_back(cd);
+            more = (cd.flags & kMoreComponents) != 0u;
+        }
+
+        // Composite gvar component offset deltas (if present)
+        keel::SmallArray<keel::f32, 8> compDx;
+        keel::SmallArray<keel::f32, 8> compDy;
+        if (m_hasActiveVariation && m_gvarOffset != 0u && !comps.empty()) {
+            keel::Array<keel::i32> zeroOrig(comps.size(), 0);
+            keel::Array<keel::u16> emptyEndPts;
+            apply_gvar_deltas(glyphIndex, zeroOrig, zeroOrig, emptyEndPts, keel::as<keel::u32>(comps.size()), scratch);
+            for (keel::usize i = 0u; i < comps.size(); ++i) {
+                compDx.push_back(scratch.varDeltaX[i]);
+                compDy.push_back(scratch.varDeltaY[i]);
+            }
+        }
+
+        for (keel::usize i = 0u; i < comps.size(); ++i) {
+            const CompDesc& cd = comps[i];
             keel::f32 ctx = 0.0f, cty = 0.0f;
-            if ((cFlags & kArgsAreXYValues) != 0u) {
-                ctx = keel::as<keel::f32>(arg1);
-                cty = keel::as<keel::f32>(arg2);
+            if ((cd.flags & kArgsAreXYValues) != 0u) {
+                ctx = keel::as<keel::f32>(cd.arg1) + ((i < compDx.size()) ? compDx[i] : 0.0f);
+                cty = keel::as<keel::f32>(cd.arg2) + ((i < compDy.size()) ? compDy[i] : 0.0f);
             } else {
                 keel::Array<keel::f32> compPtsX;
                 keel::Array<keel::f32> compPtsY;
-                OutlineBuilder dummy;
-                (void)extract_ttf_glyph_outline(compGid, cm00, cm01, cm10, cm11, 0.0f, 0.0f, xf, flatness, depth + 1u, dummy, &compPtsX, &compPtsY);
-                if (arg1 >= 0 && keel::as<keel::usize>(arg1) < parentPtsX.size() &&
-                    arg2 >= 0 && keel::as<keel::usize>(arg2) < compPtsX.size()) {
-                    ctx = parentPtsX[keel::as<keel::usize>(arg1)] - compPtsX[keel::as<keel::usize>(arg2)];
-                    cty = parentPtsY[keel::as<keel::usize>(arg1)] - compPtsY[keel::as<keel::usize>(arg2)];
+                OutlineBuilder dummy{};
+                (void)extract_ttf_glyph_outline(cd.gid, cd.cm00, cd.cm01, cd.cm10, cd.cm11, 0.0f, 0.0f, xf, flatness, depth + 1u, dummy, scratch, &compPtsX, &compPtsY);
+                if (cd.arg1 >= 0 && keel::as<keel::usize>(cd.arg1) < parentPtsX.size() &&
+                    cd.arg2 >= 0 && keel::as<keel::usize>(cd.arg2) < compPtsX.size()) {
+                    ctx = parentPtsX[keel::as<keel::usize>(cd.arg1)] - compPtsX[keel::as<keel::usize>(cd.arg2)];
+                    cty = parentPtsY[keel::as<keel::usize>(cd.arg1)] - compPtsY[keel::as<keel::usize>(cd.arg2)];
                 }
             }
 
-            const keel::f32 nm00 = m00 * cm00 + m01 * cm10;
-            const keel::f32 nm01 = m00 * cm01 + m01 * cm11;
-            const keel::f32 nm10 = m10 * cm00 + m11 * cm10;
-            const keel::f32 nm11 = m10 * cm01 + m11 * cm11;
+            const keel::f32 nm00 = m00 * cd.cm00 + m01 * cd.cm10;
+            const keel::f32 nm01 = m00 * cd.cm01 + m01 * cd.cm11;
+            const keel::f32 nm10 = m10 * cd.cm00 + m11 * cd.cm10;
+            const keel::f32 nm11 = m10 * cd.cm01 + m11 * cd.cm11;
             const keel::f32 ntx = m00 * ctx + m01 * cty + tx;
             const keel::f32 nty = m10 * ctx + m11 * cty + ty;
 
             (void)extract_ttf_glyph_outline(
-                compGid, nm00, nm01, nm10, nm11, ntx, nty, xf, flatness, depth + 1u, out, &parentPtsX, &parentPtsY
+                cd.gid, nm00, nm01, nm10, nm11, ntx, nty, xf, flatness, depth + 1u, out, scratch, &parentPtsX, &parentPtsY
             );
-
-            more = (cFlags & kMoreComponents) != 0u;
         }
 
         if (outPointsX && outPointsY) {
@@ -1934,13 +3142,15 @@ void FontFace::compute_glyph_units_bbox(keel::u32 glyphIndex, keel::i16& outYMin
     xf.scaleX = 1.0f;
     xf.hint.enabled = false;
     xf.hint.scale = 1.0f;
-    OutlineBuilder ob;
-    if (extract_cff_glyph_outline(glyphIndex, xf, 2.0f, ob) && !ob.segments.empty()) {
+    keel::Array<RasterScratch::Segment> segs;
+    OutlineBuilder ob{};
+    ob.segments = &segs;
+    if (extract_cff_glyph_outline(glyphIndex, xf, 2.0f, ob) && !segs.empty()) {
         keel::f32 minY = 1.0e9f;
         keel::f32 maxY = -1.0e9f;
-        for (keel::usize i = 0u; i < ob.segments.size(); ++i) {
-            const keel::f32 y0 = -ob.segments[i].y0;
-            const keel::f32 y1 = -ob.segments[i].y1;
+        for (keel::usize i = 0u; i < segs.size(); ++i) {
+            const keel::f32 y0 = -segs[i].y0;
+            const keel::f32 y1 = -segs[i].y1;
             minY = keel::min(minY, keel::min(y0, y1));
             maxY = keel::max(maxY, keel::max(y0, y1));
         }
@@ -1949,35 +3159,11 @@ void FontFace::compute_glyph_units_bbox(keel::u32 glyphIndex, keel::i16& outYMin
     }
 }
 
-// ==============================================================================
-// Top-Level Glyph Rasterization (Grayscale & 5-Tap LCD Subpixel)
-// ==============================================================================
-
-bool FontFace::rasterize(
-    keel::u32 glyphIndex,
+FontFace::Transform2D FontFace::make_transform(
     keel::f32 fontSizePx,
-    const RasterOptions& opts,
-    GlyphBitmap& out
-) const {
-    out = GlyphBitmap{};
-    out.isSubpixel = opts.subpixel;
-    out.empty = true;
-
-    if (!m_valid || fontSizePx <= 0.0f) {
-        return false;
-    }
-
+    const RasterOptions& opts
+) const noexcept {
     const keel::f32 scale = fontSizePx / keel::as<keel::f32>(m_unitsPerEm);
-    const keel::u16 advUnits = advance_width_units(glyphIndex);
-    keel::f32 advPx = keel::as<keel::f32>(advUnits) * scale;
-    if (opts.hinting == Hinting::Normal) {
-        advPx = keel::round(advPx);
-    }
-    if (opts.syntheticBold) {
-        advPx += 0.35f;
-    }
-    out.advancePx = advPx;
-
     const keel::f32 xMul = opts.subpixel ? 3.0f : 1.0f;
     const keel::f32 phasePx = (opts.hinting != Hinting::Normal)
         ? (keel::as<keel::f32>(opts.subpixelPhase & 0x03u) * 0.25f)
@@ -1989,28 +3175,105 @@ bool FontFace::rasterize(
     xf.shiftX = phasePx * xMul;
     xf.hint.scale = scale;
     xf.hint.enabled = (opts.hinting != Hinting::None) && (m_xHeight > 0) && (m_capHeight > m_xHeight);
+    xf.hint.snapStems = xf.hint.enabled && (fontSizePx <= 32.0f);
     if (xf.hint.enabled) {
+        xf.hint.descenderUnits = keel::as<keel::f32>(m_descenderBlue);
         xf.hint.xHeightUnits = keel::as<keel::f32>(m_xHeight);
         xf.hint.capHeightUnits = keel::as<keel::f32>(m_capHeight);
+        xf.hint.descenderPx = (m_descenderBlue < 0) ? -keel::max(1.0f, keel::round(-xf.hint.descenderUnits * scale)) : 0.0f;
         xf.hint.xHeightPx = keel::max(1.0f, keel::round(xf.hint.xHeightUnits * scale));
         xf.hint.capHeightPx = keel::max(xf.hint.xHeightPx + 1.0f, keel::round(xf.hint.capHeightUnits * scale));
         xf.hint.overshootClampUnits = (fontSizePx <= 28.0f) ? (0.42f / scale) : 0.0f;
     }
+    return xf;
+}
 
-    OutlineBuilder ob;
-    ob.segments.reserve(128u);
+// ==============================================================================
+// Vector Outline Extraction API
+// ==============================================================================
+
+bool FontFace::extract_outline(
+    keel::u32 glyphIndex,
+    keel::f32 fontSizePx,
+    const RasterOptions& opts,
+    const OutlineSink& sink,
+    RasterScratch* scratch
+) const {
+    if (!m_valid || fontSizePx <= 0.0f) {
+        return false;
+    }
+
+    RasterScratch localScratch;
+    RasterScratch& sc = scratch ? *scratch : localScratch;
+
+    RasterOptions vecOpts = opts;
+    vecOpts.subpixel = false; // Vector outlines are always emitted in 1x pixel space
+    const Transform2D xf = make_transform(fontSizePx, vecOpts);
+
+    OutlineBuilder ob{};
+    ob.sink = &sink;
+    return m_isCff
+        ? extract_cff_glyph_outline(glyphIndex, xf, 0.14f, ob)
+        : extract_ttf_glyph_outline(glyphIndex, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, xf, 0.14f, 0u, ob, sc);
+}
+
+// ==============================================================================
+// Top-Level Glyph Rasterization (Grayscale & 5-Tap LCD Subpixel, Zero-Alloc Hot Path)
+// ==============================================================================
+
+bool FontFace::rasterize(
+    keel::u32 glyphIndex,
+    keel::f32 fontSizePx,
+    const RasterOptions& opts,
+    GlyphBitmap& out,
+    RasterScratch* scratch
+) const {
+    out = GlyphBitmap{};
+    out.isSubpixel = opts.subpixel;
+    out.empty = true;
+
+    if (!m_valid || fontSizePx <= 0.0f) {
+        return false;
+    }
+
+    RasterScratch localScratch;
+    RasterScratch& sc = scratch ? *scratch : localScratch;
+    sc.segments.clear();
+
+    const keel::f32 scale = fontSizePx / keel::as<keel::f32>(m_unitsPerEm);
+    keel::f32 advPx = advance_width_px(glyphIndex, fontSizePx, opts.hinting, opts.syntheticBold);
+
+    const keel::f32 xMul = opts.subpixel ? 3.0f : 1.0f;
+    const Transform2D xf = make_transform(fontSizePx, opts);
+
+    OutlineBuilder ob{};
+    ob.segments = &sc.segments;
     const keel::f32 flatness = opts.subpixel ? 0.12f : 0.14f;
     const bool ok = m_isCff
         ? extract_cff_glyph_outline(glyphIndex, xf, flatness, ob)
-        : extract_ttf_glyph_outline(glyphIndex, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, xf, flatness, 0u, ob);
-    if (!ok || ob.segments.empty()) {
+        : extract_ttf_glyph_outline(glyphIndex, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, xf, flatness, 0u, ob, sc);
+
+    // If variable TTF has no `HVAR`, fold phantom point advance delta from `gvar` into `advPx`
+    if (ok && !m_isCff && m_hasActiveVariation && m_hvarIvsOffset == 0u && m_gvarOffset != 0u && sc.varDeltaX.size() >= 2u) {
+        const keel::usize n = sc.varDeltaX.size();
+        const keel::f32 phantomAdvDelta = sc.varDeltaX[n - 3u] - sc.varDeltaX[n - 4u];
+        if (keel::abs(phantomAdvDelta) > 1.0e-4f) {
+            const keel::f32 baseAdvUnits = keel::as<keel::f32>(advance_width_units(glyphIndex)) + phantomAdvDelta;
+            advPx = keel::max(0.0f, baseAdvUnits * scale);
+            if (opts.hinting == Hinting::Normal) advPx = keel::round(advPx);
+            if (opts.syntheticBold) advPx += 0.35f;
+        }
+    }
+    out.advancePx = advPx;
+
+    if (!ok || sc.segments.empty()) {
         return true;
     }
 
     keel::f32 minX = 1.0e9f, maxX = -1.0e9f;
     keel::f32 minY = 1.0e9f, maxY = -1.0e9f;
-    for (keel::usize i = 0u; i < ob.segments.size(); ++i) {
-        const auto& s = ob.segments[i];
+    for (keel::usize i = 0u; i < sc.segments.size(); ++i) {
+        const auto& s = sc.segments[i];
         minX = keel::min(minX, keel::min(s.x0, s.x1));
         maxX = keel::max(maxX, keel::max(s.x0, s.x1));
         minY = keel::min(minY, keel::min(s.y0, s.y1));
@@ -2047,14 +3310,15 @@ bool FontFace::rasterize(
     const keel::u32 bufH = keel::as<keel::u32>(pixelH);
     const keel::u32 deltaStride = bufW + 1u;
 
-    keel::Array<keel::f32> deltaBuf(keel::as<keel::usize>(deltaStride) * keel::as<keel::usize>(bufH), 0.0f);
+    const keel::usize deltaCount = keel::as<keel::usize>(deltaStride) * keel::as<keel::usize>(bufH);
+    sc.deltaBuf.assign(deltaCount, 0.0f);
     const keel::f32 originX = keel::as<keel::f32>(minPixX) * xMul;
     const keel::f32 originY = keel::as<keel::f32>(minPixY);
 
-    for (keel::usize i = 0u; i < ob.segments.size(); ++i) {
-        const auto& s = ob.segments[i];
+    for (keel::usize i = 0u; i < sc.segments.size(); ++i) {
+        const auto& s = sc.segments[i];
         rasterize_edge(
-            deltaBuf.data(),
+            sc.deltaBuf.data(),
             bufW,
             bufH,
             deltaStride,
@@ -2065,10 +3329,11 @@ bool FontFace::rasterize(
         );
     }
 
-    keel::Array<keel::f32> cov(keel::as<keel::usize>(bufW) * keel::as<keel::usize>(bufH), 0.0f);
+    const keel::usize covCount = keel::as<keel::usize>(bufW) * keel::as<keel::usize>(bufH);
+    sc.coverageBuf.resize(covCount);
     for (keel::u32 y = 0u; y < bufH; ++y) {
-        const keel::f32* dRow = deltaBuf.data() + keel::as<keel::usize>(y) * keel::as<keel::usize>(deltaStride);
-        keel::f32* cRow = cov.data() + keel::as<keel::usize>(y) * keel::as<keel::usize>(bufW);
+        const keel::f32* dRow = sc.deltaBuf.data() + keel::as<keel::usize>(y) * keel::as<keel::usize>(deltaStride);
+        keel::f32* cRow = sc.coverageBuf.data() + keel::as<keel::usize>(y) * keel::as<keel::usize>(bufW);
         keel::f32 acc = 0.0f;
         for (keel::u32 x = 0u; x < bufW; ++x) {
             acc += dRow[x];
@@ -2077,7 +3342,7 @@ bool FontFace::rasterize(
     }
 
     if (opts.syntheticBold) {
-        apply_synthetic_bold_dilation(cov, bufW, bufH, boldRadiusPx * xMul, boldRadiusPx * 0.35f);
+        apply_synthetic_bold_dilation(sc.coverageBuf, sc.boldRowScratch, bufW, bufH, boldRadiusPx * xMul, boldRadiusPx * 0.35f);
     }
 
     const keel::u32 rowBytes = opts.subpixel ? (keel::as<keel::u32>(pixelW) * 3u) : keel::as<keel::u32>(pixelW);
@@ -2096,7 +3361,7 @@ bool FontFace::rasterize(
         static constexpr keel::f32 kW2 = 112.0f / 256.0f;
 
         for (keel::u32 y = 0u; y < bufH; ++y) {
-            const keel::f32* src = cov.data() + keel::as<keel::usize>(y) * keel::as<keel::usize>(bufW);
+            const keel::f32* src = sc.coverageBuf.data() + keel::as<keel::usize>(y) * keel::as<keel::usize>(bufW);
             keel::u8* dst = out.pixels.data() + keel::as<keel::usize>(y) * keel::as<keel::usize>(rowBytes);
             for (keel::u32 x = 0u; x < bufW; ++x) {
                 const keel::f32 sM2 = (x >= 2u) ? src[x - 2u] : 0.0f;
@@ -2109,8 +3374,8 @@ bool FontFace::rasterize(
             }
         }
     } else {
-        for (keel::usize i = 0u; i < cov.size(); ++i) {
-            out.pixels[i] = keel::as<keel::u8>(keel::clamp(keel::round_i32(cov[i] * 255.0f), 0, 255));
+        for (keel::usize i = 0u; i < covCount; ++i) {
+            out.pixels[i] = keel::as<keel::u8>(keel::clamp(keel::round_i32(sc.coverageBuf[i] * 255.0f), 0, 255));
         }
     }
 

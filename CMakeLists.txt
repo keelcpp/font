@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(keel_font VERSION 0.1.0 LANGUAGES CXX)
+project(keel_font VERSION 0.2.0 LANGUAGES CXX)
 
 option(KEEL_FONT_NO_EXCEPTIONS_RTTI "Compile keel_font without C++ exceptions and RTTI" OFF)
 option(KEEL_FONT_BUILD_TESTS "Build keel_font unit tests and header purity checks" ${PROJECT_IS_TOP_LEVEL})
